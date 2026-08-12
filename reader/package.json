@@ -1,0 +1,13 @@
+{
+  "name": "zheungyuan-rentals-reader",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "latest",
+    "pg": "latest",
+    "qrcode": "latest",
+    "whatsapp-web.js": "latest"
+  }
+}
