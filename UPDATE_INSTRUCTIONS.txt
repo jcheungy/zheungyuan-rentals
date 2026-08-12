@@ -1,20 +1,30 @@
-Zheungyuan Rentals – Detached Frame Fix
+Zheungyuan Rentals – Browser Sync Update
 
 Replace:
 reader/server.js
 
 with this version and commit to main.
 
-Changes:
-- /labels now uses client.getLabels() directly instead of scanning every chat.
-- Each label uses label.getChats() for its chat count.
-- Adds retry handling for transient Puppeteer errors:
-  Attempted to use detached Frame
-  Execution context was destroyed
-- /sync/chats with a label now resolves that label first and imports only chats attached to it.
+This keeps:
+- WhatsApp QR / LocalAuth
+- Railway Chromium lock cleanup
+- detached-frame retry
+- /labels
+- label-filtered /sync/chats
+
+It adds a simple browser button on the reader home page:
+"Sync Tenants"
+
+Defaults:
+- 20 chats
+- 150 messages per chat
+- label = Tenants
 
 After Railway redeploys:
-1. Open /qr and confirm WhatsApp is connected.
-2. Open /labels.
-3. Send the JSON result back.
-4. Do NOT run /sync/chats yet until we confirm the rental label.
+1. Open the whatsapp-reader home URL.
+2. Confirm Status = Connected.
+3. Click "Sync Tenants".
+4. Copy the JSON result shown on the page and send it to ChatGPT.
+5. Then open the Zheungyuan /admin dashboard.
+
+No curl or terminal command is required.

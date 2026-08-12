@@ -226,20 +226,80 @@ app.get("/", (req,res) => {
         .tag{color:#ba9251;text-transform:uppercase;letter-spacing:.12em;font-size:12px}
         .box{background:#fff;padding:24px;border:1px solid #d8d1c4;margin:18px 0}
         a{color:#15342c}
+        button{background:#17372e;color:white;border:0;padding:13px 20px;font-size:15px;cursor:pointer}
+        button:disabled{opacity:.5;cursor:not-allowed}
+        input{padding:10px;border:1px solid #cfc8bc;width:90px}
+        label{display:inline-block;margin-right:18px}
+        pre{white-space:pre-wrap;background:#f7f4ee;padding:14px;border:1px solid #ddd5c8}
       </style>
     </head>
     <body>
       <div class="tag">張園 / Zheungyuan</div>
       <h1>WhatsApp rental reader</h1>
-      <div class="box">Status: <b>${waReady ? "Connected" : "Waiting for WhatsApp"}</b></div>
+
+      <div class="box">
+        Status: <b>${waReady ? "Connected" : "Waiting for WhatsApp"}</b>
+      </div>
+
       <div class="box">
         <a href="/qr">Open QR pairing</a><br><br>
         <a href="/status">Status JSON</a><br><br>
         <a href="/labels">Preview WhatsApp labels</a>
       </div>
+
       <div class="box">
-        Next step: check <code>/labels</code> first, then sync only the rental-labelled chats.
+        <h3>Test import: Tenants</h3>
+        <p>This imports only chats with the <b>Tenants</b> WhatsApp label.</p>
+
+        <label>
+          Chats
+          <input id="limitChats" type="number" min="1" max="250" value="20">
+        </label>
+
+        <label>
+          Messages per chat
+          <input id="messagesPerChat" type="number" min="10" max="500" value="150">
+        </label>
+
+        <div style="margin-top:18px">
+          <button id="syncBtn" onclick="runSync()" ${waReady ? "" : "disabled"}>
+            Sync Tenants
+          </button>
+        </div>
+
+        <pre id="result">No sync run yet.</pre>
       </div>
+
+      <script>
+        async function runSync() {
+          const btn = document.getElementById("syncBtn");
+          const result = document.getElementById("result");
+          const limitChats = Number(document.getElementById("limitChats").value || 20);
+          const messagesPerChat = Number(document.getElementById("messagesPerChat").value || 150);
+
+          btn.disabled = true;
+          result.textContent = "Syncing Tenants…";
+
+          try {
+            const response = await fetch("/sync/chats", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                label: "Tenants",
+                limitChats,
+                messagesPerChat
+              })
+            });
+
+            const data = await response.json();
+            result.textContent = JSON.stringify(data, null, 2);
+          } catch (err) {
+            result.textContent = "Error: " + err.message;
+          } finally {
+            btn.disabled = false;
+          }
+        }
+      </script>
     </body>
   </html>`);
 });
