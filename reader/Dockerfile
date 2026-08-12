@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y \
     chromium \
     ca-certificates \
     fonts-liberation \
+    git \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -23,23 +24,34 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
 COPY package*.json ./
 RUN npm install --omit=dev
 
 COPY . .
 
-# whatsapp-web.js 1.34.7 is the latest published release as of Aug 2026,
-# but WhatsApp Web 2.3000.104xxx introduced an upstream getChats() "r: r"
-# regression. Apply the exact upstream PR #201850 patch while it remains
-# unmerged/unreleased.
-RUN node -e "const v=require('./node_modules/whatsapp-web.js/package.json').version; if(v!=='1.34.7'){console.error('Unexpected whatsapp-web.js version:',v); process.exit(1)}"
-RUN patch --batch --forward -p1 -d node_modules/whatsapp-web.js < patches/wwebjs-pr-201850.patch
+# Both upstream fixes below were authored against this exact whatsapp-web.js
+# base commit (version 1.34.7, but newer than the published npm tag).
+ARG WWEBJS_BASE=942d236a11ad68807308b058303ba5256915979c
 
-# Fail the image build rather than deploy an unpatched reader.
-RUN grep -q "window.WWebJS.getMsgKeyId" node_modules/whatsapp-web.js/src/util/Injected/Utils.js \
- && grep -q "skip chats that fail serialization" node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+RUN git clone https://github.com/wwebjs/whatsapp-web.js.git /tmp/wwebjs \
+ && cd /tmp/wwebjs \
+ && git checkout "$WWEBJS_BASE" \
+ && patch --batch --forward -p1 < /app/patches/wwebjs-pr-201850.patch \
+ && patch --batch --forward -p1 < /app/patches/wwebjs-pr-201853.patch \
+ && rm -rf /app/node_modules/whatsapp-web.js \
+ && cp -a /tmp/wwebjs /app/node_modules/whatsapp-web.js \
+ && rm -rf /tmp/wwebjs
 
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV WWEBJS_PATCH=PR201850-5b6bb00
+# Refuse to deploy if either upstream fix is absent.
+RUN grep -q "window.WWebJS.getMsgKeyId" /app/node_modules/whatsapp-web.js/src/util/Injected/Utils.js \
+ && grep -q "skip chats that fail serialization" /app/node_modules/whatsapp-web.js/src/util/Injected/Utils.js \
+ && grep -q "EMIT_BY_SCREEN" /app/node_modules/whatsapp-web.js/src/Client.js \
+ && grep -q "WAWebStreamModel" /app/node_modules/whatsapp-web.js/src/Client.js
+
+ENV WWEBJS_BASE=942d236a11ad68807308b058303ba5256915979c
+ENV WWEBJS_PATCHES=PR201850+PR201853
 
 CMD ["node","server.js"]

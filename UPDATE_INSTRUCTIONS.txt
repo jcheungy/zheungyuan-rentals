@@ -1,47 +1,41 @@
-Zheungyuan Rentals — consolidated whatsapp-web.js fix
+Zheungyuan Rentals — final consolidated WhatsApp library build
 Date: 2026-08-13
 
-This is intentionally NOT another server.js workaround.
+Why this supersedes the earlier consolidated package:
+The phone still lists the Railway browser as a linked device, and Railway logs
+show "WhatsApp authenticated" but never "WhatsApp ready". That confirms the
+persistent session is valid and the volume is working; the remaining blocker is
+the upstream restored-session ready-state bug.
 
-Root cause confirmed:
-- The current app installs whatsapp-web.js "latest".
-- npm latest is 1.34.7.
-- whatsapp-web.js 1.34.7 has a known upstream regression with current
-  WhatsApp Web 2.3000.104xxx where Client.getChats() can throw "r: r".
-- Upstream PR #201850 (commit 5b6bb00) fixes this exact failure but is still
-  open/unreleased.
-- The current upstream main branch still contains the broken Promise.all/
-  _serialized implementation, so switching from npm "latest" to main would
-  not fix it.
+I checked both upstream fixes carefully:
+- PR #201850 fixes Client.getChats() -> "r: r"
+- PR #201853 fixes authenticated/restored sessions that remain stuck without
+  surfacing "ready"
+- BOTH PRs were authored against the SAME exact upstream base commit:
+  942d236a11ad68807308b058303ba5256915979c
+- They modify different files, so they do not conflict:
+  #201850 -> src/util/Injected/Utils.js
+  #201853 -> src/Client.js
 
-Files to replace/add in GitHub:
+This build therefore uses that exact upstream base commit and applies BOTH exact
+upstream patches. This avoids trying to apply a main-branch patch onto the older
+published npm source by accident.
 
+GitHub changes:
 1. Replace reader/package.json
 2. Replace reader/Dockerfile
-3. Add reader/patches/wwebjs-pr-201850.patch
+3. Replace/add reader/patches/wwebjs-pr-201850.patch
+4. Add reader/patches/wwebjs-pr-201853.patch
 
-Do NOT replace reader/server.js for this update.
-Your existing QR/session, label UI and Sync Tenants button remain unchanged.
+Do NOT change reader/server.js.
+Do NOT delete the Railway volume.
+Do NOT unlink WhatsApp on the phone.
 
-What this update does:
-- Pins whatsapp-web.js to 1.34.7 instead of "latest".
-- Pins the other direct reader dependencies too.
-- Applies the exact upstream PR #201850 patch during the Railway Docker build.
-- Verifies the patch actually exists before the image is allowed to deploy.
-- Keeps the persistent WhatsApp LocalAuth volume unchanged.
-
-Expected Railway build log:
-- npm install completes
-- patching file src/util/Injected/Utils.js
-- Docker build passes the grep verification
-- reader starts
+Expected deploy log:
+- volume mounts
+- stale Chromium lock files removed by existing server.js
+- Reader listening ...
+- WhatsApp authenticated
 - WhatsApp ready
 
-After deployment:
-1. Open the reader homepage.
-2. Confirm Status = Connected.
-3. Click Sync Tenants.
-4. Send ChatGPT the JSON result.
-
-If the Docker build fails at the patch step, stop there and send the build log.
-That is preferable to deploying another silently broken reader.
+After that, open the reader homepage and click Sync Tenants.
