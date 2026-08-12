@@ -5,9 +5,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "latest",
-    "pg": "latest",
-    "qrcode": "latest",
-    "whatsapp-web.js": "latest"
+    "express": "5.2.1",
+    "pg": "8.22.0",
+    "qrcode": "1.5.4",
+    "whatsapp-web.js": "1.34.7"
   }
 }
