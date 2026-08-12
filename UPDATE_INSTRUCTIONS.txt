@@ -1,21 +1,26 @@
-Zheungyuan Rentals – Reader Update
+Zheungyuan Rentals – Chromium Lock Fix
 
-Replace this file in GitHub:
+Replace:
 reader/server.js
 
-with the provided server.js.
+with this server.js and commit to main.
 
-No other file changes are required for this update.
+What changed:
+- Keeps your existing WhatsApp LocalAuth session.
+- Before Chromium starts, removes only stale Railway/Chromium lock files:
+  SingletonLock
+  SingletonSocket
+  SingletonCookie
+- Does NOT delete the WhatsApp authentication profile or Railway volume.
+- Retains the /labels endpoint and label-filtered /sync/chats endpoint from the previous update.
 
-After committing to main:
-1. Railway should auto-deploy the whatsapp-reader service.
-2. Open the reader home page.
-3. Confirm WhatsApp still says Connected.
-4. Open /labels.
-5. Send me the JSON shown there.
-6. Do NOT run /sync/chats yet until we confirm the exact rental label name.
+After Railway redeploys:
+1. Open the whatsapp-reader service logs.
+2. Look for either:
+   "Removed stale Chromium lock: ..."
+   and then
+   "WhatsApp ready"
+3. Open /qr. It should say "WhatsApp is connected."
+4. Then open /labels and send the JSON result back to ChatGPT.
 
-What this update adds:
-- GET /labels to preview WhatsApp labels and chat counts.
-- POST /sync/chats now accepts a label field.
-- This lets us import only chats carrying the chosen rental/property label.
+Do not delete the Railway volume.

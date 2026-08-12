@@ -1,6 +1,8 @@
 const express = require("express");
 const QRCode = require("qrcode");
 const pg = require("pg");
+const fs = require("fs");
+const path = require("path");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 
 const app = express();
@@ -16,9 +18,33 @@ let waReady = false;
 let syncState = { running: false, lastSync: null, chatsSeen: 0, messagesSaved: 0 };
 
 const authPath = process.env.WA_AUTH_PATH || "./.wwebjs_auth";
+const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
+
+// Railway can leave Chromium Singleton* lock files behind on the persistent
+// WhatsApp volume after a redeploy. Remove only those stale browser locks;
+// do not remove the LocalAuth session itself.
+function clearStaleChromiumLocks() {
+  const sessionDir = path.join(authPath, `session-${clientId}`);
+  const lockNames = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+
+  for (const name of lockNames) {
+    const target = path.join(sessionDir, name);
+    try {
+      if (fs.existsSync(target)) {
+        fs.rmSync(target, { force: true });
+        console.log(`Removed stale Chromium lock: ${target}`);
+      }
+    } catch (err) {
+      console.warn(`Could not remove stale Chromium lock ${target}:`, err.message);
+    }
+  }
+}
+
+clearStaleChromiumLocks();
+
 const client = new Client({
   authStrategy: new LocalAuth({
-    clientId: process.env.WA_CLIENT_ID || "zheungyuan-rentals",
+    clientId,
     dataPath: authPath
   }),
   puppeteer: {
