@@ -1,41 +1,40 @@
-Zheungyuan Rentals — final consolidated WhatsApp library build
-Date: 2026-08-13
+張園 / Zheungyuan — Premium photo-led homepage
 
-Why this supersedes the earlier consolidated package:
-The phone still lists the Railway browser as a linked device, and Railway logs
-show "WhatsApp authenticated" but never "WhatsApp ready". That confirms the
-persistent session is valid and the volume is working; the remaining blocker is
-the upstream restored-session ready-state bug.
+Replace these files in the GitHub repo:
+- web/app/page.js
+- web/app/styles.css
+- web/app/layout.js
 
-I checked both upstream fixes carefully:
-- PR #201850 fixes Client.getChats() -> "r: r"
-- PR #201853 fixes authenticated/restored sessions that remain stuck without
-  surfacing "ready"
-- BOTH PRs were authored against the SAME exact upstream base commit:
-  942d236a11ad68807308b058303ba5256915979c
-- They modify different files, so they do not conflict:
-  #201850 -> src/util/Injected/Utils.js
-  #201853 -> src/Client.js
+This update does NOT touch:
+- reader/server.js
+- reader/Dockerfile
+- WhatsApp patches
+- Postgres
+- Railway volume
+- the prospect-import work
 
-This build therefore uses that exact upstream base commit and applies BOTH exact
-upstream patches. This avoids trying to apply a main-branch patch onto the older
-published npm source by accident.
+What changes:
+- removes the block-model house artwork
+- introduces a full photographic hero
+- adds premium landlord positioning
+- adds 3 sample photo-led property cards
+- adds a demand/matching concept section
+- upgrades the process and final landlord CTA
+- keeps the admin table styling intact
+- responsive mobile layout included
 
-GitHub changes:
-1. Replace reader/package.json
-2. Replace reader/Dockerfile
-3. Replace/add reader/patches/wwebjs-pr-201850.patch
-4. Add reader/patches/wwebjs-pr-201853.patch
+Photography:
+The homepage currently uses temporary Unsplash-hosted placeholder photography.
+These are intentionally presentation placeholders. Replace them with actual
+張園 property photography when real listings are ready.
 
-Do NOT change reader/server.js.
-Do NOT delete the Railway volume.
-Do NOT unlink WhatsApp on the phone.
+Important:
+The sample property cards explicitly say "Sample presentation" / "Preview only"
+so visitors are not led to believe they are live listings.
 
-Expected deploy log:
-- volume mounts
-- stale Chromium lock files removed by existing server.js
-- Reader listening ...
-- WhatsApp authenticated
-- WhatsApp ready
-
-After that, open the reader homepage and click Sync Tenants.
+Recommended order:
+1. Commit these 3 files to main.
+2. Let Railway redeploy the web service.
+3. Review the homepage on desktop + phone.
+4. Later replace placeholder photos, sample cards and the final contact CTA with
+   actual listing data and the public WhatsApp/contact details.
