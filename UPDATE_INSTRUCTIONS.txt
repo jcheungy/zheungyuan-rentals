@@ -1,26 +1,26 @@
-Zheungyuan Rentals – Chromium Lock Fix
+Zheungyuan Rentals – Chromium Lock Fix v2
 
 Replace:
 reader/server.js
 
-with this server.js and commit to main.
+with this version and commit to main.
 
-What changed:
-- Keeps your existing WhatsApp LocalAuth session.
-- Before Chromium starts, removes only stale Railway/Chromium lock files:
-  SingletonLock
-  SingletonSocket
-  SingletonCookie
-- Does NOT delete the WhatsApp authentication profile or Railway volume.
-- Retains the /labels endpoint and label-filtered /sync/chats endpoint from the previous update.
+Why v1 failed:
+Chromium's SingletonLock is commonly a symlink. On a Railway redeploy that
+symlink points to the old container hostname, so it becomes a broken symlink.
+Node's fs.existsSync() returns false for a broken symlink, which meant v1
+didn't remove it.
 
-After Railway redeploys:
-1. Open the whatsapp-reader service logs.
-2. Look for either:
-   "Removed stale Chromium lock: ..."
-   and then
-   "WhatsApp ready"
-3. Open /qr. It should say "WhatsApp is connected."
-4. Then open /labels and send the JSON result back to ChatGPT.
+v2:
+- searches the WhatsApp LocalAuth path
+- removes SingletonLock, SingletonSocket and SingletonCookie directly
+- works even when they are broken symlinks
+- does NOT delete the WhatsApp authentication/session data
+- keeps /labels and label-filtered /sync/chats
+
+After deployment, the log should show:
+Removed stale Chromium lock: ...
+WhatsApp authenticated
+WhatsApp ready
 
 Do not delete the Railway volume.

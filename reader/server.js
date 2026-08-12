@@ -24,20 +24,49 @@ const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
 // WhatsApp volume after a redeploy. Remove only those stale browser locks;
 // do not remove the LocalAuth session itself.
 function clearStaleChromiumLocks() {
-  const sessionDir = path.join(authPath, `session-${clientId}`);
-  const lockNames = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+  const lockNames = new Set(["SingletonLock", "SingletonSocket", "SingletonCookie"]);
+  const roots = [
+    authPath,
+    path.join(authPath, `session-${clientId}`)
+  ];
 
-  for (const name of lockNames) {
-    const target = path.join(sessionDir, name);
+  function walk(dir, depth = 0) {
+    if (depth > 3) return;
+
+    let entries;
     try {
-      if (fs.existsSync(target)) {
-        fs.rmSync(target, { force: true });
-        console.log(`Removed stale Chromium lock: ${target}`);
-      }
+      entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (err) {
-      console.warn(`Could not remove stale Chromium lock ${target}:`, err.message);
+      if (err.code !== "ENOENT") {
+        console.warn(`Could not inspect ${dir}:`, err.message);
+      }
+      return;
+    }
+
+    for (const entry of entries) {
+      const target = path.join(dir, entry.name);
+
+      if (lockNames.has(entry.name)) {
+        try {
+          // Chromium's SingletonLock/Socket are often symlinks. existsSync()
+          // can return false for a broken symlink, so unlink directly instead.
+          fs.unlinkSync(target);
+          console.log(`Removed stale Chromium lock: ${target}`);
+        } catch (err) {
+          if (err.code !== "ENOENT") {
+            console.warn(`Could not remove stale Chromium lock ${target}:`, err.message);
+          }
+        }
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        walk(target, depth + 1);
+      }
     }
   }
+
+  for (const root of roots) walk(root);
 }
 
 clearStaleChromiumLocks();
