@@ -6,8 +6,9 @@ async function getRenters() {
   try {
     const { rows } = await pool.query(`
       SELECT id, display_name, phone, area_wanted, budget_max, preferred_floor,
-             pets_required, parking_needed, last_message_at, status
+             pets_required, parking_needed, last_message_at, status, contact_type
       FROM renters
+      WHERE contact_type = 'renter_prospect'
       ORDER BY last_message_at DESC NULLS LAST, id DESC
       LIMIT 250
     `);
@@ -25,12 +26,15 @@ export default async function Admin() {
 
   return (
     <main className="container admin-wrap">
-      <div className="kicker">Internal / Tenant demand</div>
+      <div className="kicker">Internal / Prospective renter demand</div>
       <h2>Rental enquiries</h2>
-      <p className="intro">WhatsApp conversations become reusable renter requirements.</p>
+      <p className="intro">
+        Historical viewing and property-enquiry leads that can be matched to future landlord listings.
+        Existing tenant-management conversations are excluded.
+      </p>
 
       <div className="cards">
-        <div className="card"><span>Total renters</span><strong>{renters.length}</strong></div>
+        <div className="card"><span>Prospect leads</span><strong>{renters.length}</strong></div>
         <div className="card"><span>Active</span><strong>{active}</strong></div>
         <div className="card"><span>Pets required</span><strong>{pet}</strong></div>
         <div className="card"><span>Parking required</span><strong>{parking}</strong></div>
@@ -43,7 +47,7 @@ export default async function Admin() {
           </thead>
           <tbody>
           {renters.length === 0 ? (
-            <tr><td colSpan="8">No renters imported yet. Connect the reader and sync chats.</td></tr>
+            <tr><td colSpan="8">No prospective renter leads imported yet. Preview the viewing/enquiry labels in the WhatsApp reader first.</td></tr>
           ) : renters.map(r => (
             <tr key={r.id}>
               <td>{r.display_name || r.phone || "Unknown"}</td>

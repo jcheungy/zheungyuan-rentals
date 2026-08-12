@@ -121,6 +121,7 @@ async function ensureSchema() {
     source_property TEXT,
     requirement_summary TEXT,
     status TEXT NOT NULL DEFAULT 'unknown',
+    contact_type TEXT NOT NULL DEFAULT 'unknown',
     labels JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -138,7 +139,17 @@ async function ensureSchema() {
     message_at TIMESTAMPTZ,
     raw JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  );`;
+  );
+
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS contact_type TEXT NOT NULL DEFAULT 'unknown';
+
+  UPDATE renters
+  SET contact_type = 'existing_tenant',
+      updated_at = NOW()
+  WHERE contact_type = 'unknown'
+    AND labels ? 'Tenants';
+  `;
 
   await pool.query(sql);
 }
@@ -172,7 +183,7 @@ async function withDetachedFrameRetry(fn, retries = 2) {
   throw lastErr;
 }
 
-async function upsertRenter(chat, labels = []) {
+async function upsertRenter(chat, labels = [], contactType = "unknown") {
   const id = chat.id._serialized;
 
   let contact = null;
@@ -188,15 +199,21 @@ async function upsertRenter(chat, labels = []) {
   const phone = phoneFromChatId(id);
 
   const { rows } = await pool.query(`
-    INSERT INTO renters (whatsapp_chat_id, display_name, phone, labels)
-    VALUES ($1,$2,$3,$4::jsonb)
+    INSERT INTO renters
+      (whatsapp_chat_id, display_name, phone, labels, contact_type)
+    VALUES ($1,$2,$3,$4::jsonb,$5)
     ON CONFLICT (whatsapp_chat_id) DO UPDATE SET
       display_name = COALESCE(EXCLUDED.display_name, renters.display_name),
       phone = COALESCE(EXCLUDED.phone, renters.phone),
       labels = EXCLUDED.labels,
+      contact_type = CASE
+        WHEN EXCLUDED.contact_type = 'unknown'
+          THEN renters.contact_type
+        ELSE EXCLUDED.contact_type
+      END,
       updated_at = NOW()
     RETURNING id
-  `, [id, displayName, phone, JSON.stringify(labels)]);
+  `, [id, displayName, phone, JSON.stringify(labels), contactType]);
 
   return rows[0].id;
 }
@@ -255,6 +272,250 @@ async function updateRenterDates(renterId) {
     WHERE r.id=x.renter_id
   `, [renterId]);
 }
+
+
+const PROSPECT_LABELS = ["To organise viewing", "Viewings -"];
+
+async function findProspectChats({
+  limitChats = 20,
+  scanLimit = 1000
+} = {}) {
+  const wanted = new Set(
+    PROSPECT_LABELS.map(x => x.trim().toLowerCase())
+  );
+
+  const allChats =
+    await withDetachedFrameRetry(() => client.getChats());
+
+  const directChats = allChats
+    .filter(chat => !chat.isGroup)
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+  const selected = [];
+  let chatsScanned = 0;
+  let skippedExistingTenants = 0;
+
+  for (const chat of directChats.slice(0, scanLimit)) {
+    chatsScanned++;
+
+    let chatLabels = [];
+    try {
+      chatLabels = await withDetachedFrameRetry(
+        () => client.getChatLabels(chat.id._serialized),
+        2
+      );
+    } catch (err) {
+      console.warn(
+        `Could not read labels for ${chat.id && chat.id._serialized}:`,
+        String(err && (err.message || err))
+      );
+      continue;
+    }
+
+    const labelNames =
+      chatLabels.map(label => label.name).filter(Boolean);
+
+    const normalised =
+      labelNames.map(x => String(x).trim().toLowerCase());
+
+    // Current tenant-management conversations are deliberately excluded
+    // from the landlord-facing renter-demand database.
+    if (normalised.includes("tenants")) {
+      skippedExistingTenants++;
+      continue;
+    }
+
+    const isProspect =
+      normalised.some(name => wanted.has(name));
+
+    if (!isProspect) continue;
+
+    selected.push({
+      chat,
+      labels: labelNames
+    });
+
+    if (selected.length >= limitChats) break;
+
+    await new Promise(resolve => setTimeout(resolve, 60));
+  }
+
+  return {
+    chatsScanned,
+    skippedExistingTenants,
+    selected
+  };
+}
+
+function previewProspect(chat, labels) {
+  const chatId =
+    chat && chat.id && chat.id._serialized
+      ? chat.id._serialized
+      : "";
+
+  return {
+    name: chat.name || null,
+    phone: phoneFromChatId(chatId),
+    labels,
+    lastMessageAt: chat.timestamp
+      ? new Date(chat.timestamp * 1000).toISOString()
+      : null
+  };
+}
+
+app.get("/prospects/preview", async (req, res) => {
+  if (!waReady) {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
+  }
+
+  const limitChats = Math.max(
+    1,
+    Math.min(Number(req.query.limit || 20), 50)
+  );
+
+  const scanLimit = Math.max(
+    limitChats,
+    Math.min(Number(req.query.scanLimit || 1000), 2000)
+  );
+
+  try {
+    const result =
+      await findProspectChats({ limitChats, scanLimit });
+
+    res.json({
+      ok: true,
+      labels: PROSPECT_LABELS,
+      chatsScanned: result.chatsScanned,
+      skippedExistingTenants: result.skippedExistingTenants,
+      prospectsFound: result.selected.length,
+      prospects: result.selected.map(({ chat, labels }) =>
+        previewProspect(chat, labels)
+      )
+    });
+  } catch (err) {
+    const detail =
+      String(err && (err.stack || err.message || err));
+
+    console.error("Prospect preview failed:", detail);
+
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err)),
+      detail
+    });
+  }
+});
+
+app.post("/sync/prospects", async (req, res) => {
+  if (!waReady) {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
+  }
+
+  if (syncState.running) {
+    return res.status(409).json({
+      ok: false,
+      error: "Sync already running"
+    });
+  }
+
+  const body = req.body || {};
+
+  const limitChats = Math.max(
+    1,
+    Math.min(Number(body.limitChats || 20), 50)
+  );
+
+  const messagesPerChat = Math.max(
+    20,
+    Math.min(Number(body.messagesPerChat || 150), 500)
+  );
+
+  const scanLimit = Math.max(
+    limitChats,
+    Math.min(Number(body.scanLimit || 1000), 2000)
+  );
+
+  syncState.running = true;
+
+  let chatsSeen = 0;
+  let messagesSaved = 0;
+
+  try {
+    const result =
+      await findProspectChats({ limitChats, scanLimit });
+
+    for (const { chat, labels } of result.selected) {
+      try {
+        const renterId =
+          await upsertRenter(
+            chat,
+            labels,
+            "renter_prospect"
+          );
+
+        const messages =
+          await withDetachedFrameRetry(
+            () => chat.fetchMessages({
+              limit: messagesPerChat
+            }),
+            2
+          );
+
+        for (const message of messages) {
+          messagesSaved +=
+            await saveMessage(
+              chat.id._serialized,
+              renterId,
+              message
+            );
+        }
+
+        await updateRenterDates(renterId);
+        chatsSeen++;
+      } catch (err) {
+        console.warn(
+          `Could not import prospect ${chat.id && chat.id._serialized}:`,
+          String(err && (err.stack || err.message || err))
+        );
+      }
+    }
+
+    syncState = {
+      running: false,
+      lastSync: new Date().toISOString(),
+      chatsSeen,
+      messagesSaved
+    };
+
+    res.json({
+      ok: true,
+      labels: PROSPECT_LABELS,
+      chatsScanned: result.chatsScanned,
+      skippedExistingTenants: result.skippedExistingTenants,
+      matchingProspectsFound: result.selected.length,
+      ...syncState
+    });
+  } catch (err) {
+    syncState.running = false;
+
+    const detail =
+      String(err && (err.stack || err.message || err));
+
+    console.error("Prospect sync failed:", detail);
+
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err)),
+      detail
+    });
+  }
+});
 
 app.get("/", (req, res) => {
   res.type("html").send(`
@@ -326,55 +587,86 @@ app.get("/", (req, res) => {
       </div>
 
       <div class="box">
-        <h3>Import renter enquiries</h3>
+        <h3>Prospective renter demand</h3>
         <p>
-          Scans recent WhatsApp chats and imports only conversations carrying
-          the <b>Tenants</b> label.
+          Uses only <b>To organise viewing</b> and <b>Viewings -</b>.
+          Chats carrying the <b>Tenants</b> label are excluded automatically.
         </p>
 
         <label>
-          Matching chats
-          <input id="limitChats" type="number" min="1" max="250" value="20">
+          Prospects
+          <input id="limitChats" type="number" min="1" max="50" value="20">
         </label>
 
         <label>
-          Messages per chat
-          <input id="messagesPerChat" type="number" min="10" max="500" value="150">
+          Messages per prospect
+          <input id="messagesPerChat" type="number" min="20" max="500" value="150">
         </label>
 
         <div style="margin-top:18px">
-          <button id="syncBtn" onclick="runSync()" ${waReady ? "" : "disabled"}>
-            Sync Tenants
+          <button id="previewBtn" onclick="previewProspects()" ${waReady ? "" : "disabled"}>
+            Preview prospects
+          </button>
+          <button id="syncBtn" onclick="syncProspects()" ${waReady ? "" : "disabled"} style="margin-left:8px">
+            Import prospects
           </button>
         </div>
 
-        <pre id="result">No sync run yet.</pre>
+        <pre id="result">Preview the prospects before importing them.</pre>
       </div>
 
       <script>
-        async function runSync() {
-          const btn = document.getElementById("syncBtn");
+        function prospectSettings() {
+          return {
+            limitChats: Number(
+              document.getElementById("limitChats").value || 20
+            ),
+            messagesPerChat: Number(
+              document.getElementById("messagesPerChat").value || 150
+            ),
+            scanLimit: 1000
+          };
+        }
+
+        async function previewProspects() {
+          const btn = document.getElementById("previewBtn");
           const result = document.getElementById("result");
-
-          const limitChats =
-            Number(document.getElementById("limitChats").value || 20);
-
-          const messagesPerChat =
-            Number(document.getElementById("messagesPerChat").value || 150);
+          const settings = prospectSettings();
 
           btn.disabled = true;
-          result.textContent = "Scanning WhatsApp for Tenants-labelled chats…";
+          result.textContent =
+            "Scanning for historical viewing / enquiry leads…";
 
           try {
-            const response = await fetch("/sync/chats", {
+            const response = await fetch(
+              "/prospects/preview?limit=" +
+              encodeURIComponent(settings.limitChats) +
+              "&scanLimit=" +
+              encodeURIComponent(settings.scanLimit)
+            );
+
+            const data = await response.json();
+            result.textContent = JSON.stringify(data, null, 2);
+          } catch (err) {
+            result.textContent = "Error: " + err.message;
+          } finally {
+            btn.disabled = false;
+          }
+        }
+
+        async function syncProspects() {
+          const btn = document.getElementById("syncBtn");
+          const result = document.getElementById("result");
+          const settings = prospectSettings();
+
+          btn.disabled = true;
+          result.textContent = "Importing prospective renter conversations…";
+
+          try {
+            const response = await fetch("/sync/prospects", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                label: "Tenants",
-                limitChats,
-                messagesPerChat,
-                scanLimit: 250
-              })
+              body: JSON.stringify(settings)
             });
 
             const data = await response.json();

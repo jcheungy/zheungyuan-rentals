@@ -1,40 +1,48 @@
-張園 / Zheungyuan — Premium photo-led homepage
+Zheungyuan Rentals — prospective renter lead update
 
-Replace these files in the GitHub repo:
-- web/app/page.js
-- web/app/styles.css
-- web/app/layout.js
+Purpose
+-------
+Stop using existing Tenants chats as demand data.
 
-This update does NOT touch:
-- reader/server.js
+This update changes the business dataset to:
+- "To organise viewing"
+- "Viewings -"
+
+Any chat that also has the "Tenants" label is excluded automatically.
+
+Files to replace
+----------------
+1. reader/server.js
+2. web/app/admin/page.js
+
+Do NOT change:
 - reader/Dockerfile
-- WhatsApp patches
-- Postgres
+- reader/package.json
+- reader/patches/*
 - Railway volume
-- the prospect-import work
+- WhatsApp linked device
 
-What changes:
-- removes the block-model house artwork
-- introduces a full photographic hero
-- adds premium landlord positioning
-- adds 3 sample photo-led property cards
-- adds a demand/matching concept section
-- upgrades the process and final landlord CTA
-- keeps the admin table styling intact
-- responsive mobile layout included
+The working upstream WhatsApp patches stay exactly as they are.
 
-Photography:
-The homepage currently uses temporary Unsplash-hosted placeholder photography.
-These are intentionally presentation placeholders. Replace them with actual
-張園 property photography when real listings are ready.
+New workflow
+------------
+1. Deploy both files.
+2. Open the whatsapp-reader homepage.
+3. Click "Preview prospects" FIRST.
+4. It scans up to 1,000 recent direct chats but does NOT import anything.
+5. Review the returned names/phone numbers/labels.
+6. Only if those look like genuine historical property enquiries, click "Import prospects".
 
-Important:
-The sample property cards explicitly say "Sample presentation" / "Preview only"
-so visitors are not led to believe they are live listings.
+Database
+--------
+A new renters.contact_type column is added automatically.
+Existing rows carrying the "Tenants" label are marked:
+  existing_tenant
 
-Recommended order:
-1. Commit these 3 files to main.
-2. Let Railway redeploy the web service.
-3. Review the homepage on desktop + phone.
-4. Later replace placeholder photos, sample cards and the final contact CTA with
-   actual listing data and the public WhatsApp/contact details.
+Prospect imports are marked:
+  renter_prospect
+
+The /admin page now displays only renter_prospect records, so the five test
+Tenants conversations no longer appear as landlord-facing demand.
+
+Do not click Import prospects until the preview list looks correct.
