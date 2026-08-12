@@ -15,20 +15,19 @@ const pool = new pg.Pool({
 
 let qrDataUrl = null;
 let waReady = false;
-let syncState = { running: false, lastSync: null, chatsSeen: 0, messagesSaved: 0 };
+let syncState = {
+  running: false,
+  lastSync: null,
+  chatsSeen: 0,
+  messagesSaved: 0
+};
 
 const authPath = process.env.WA_AUTH_PATH || "./.wwebjs_auth";
 const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
 
-// Railway can leave Chromium Singleton* lock files behind on the persistent
-// WhatsApp volume after a redeploy. Remove only those stale browser locks;
-// do not remove the LocalAuth session itself.
 function clearStaleChromiumLocks() {
   const lockNames = new Set(["SingletonLock", "SingletonSocket", "SingletonCookie"]);
-  const roots = [
-    authPath,
-    path.join(authPath, `session-${clientId}`)
-  ];
+  const roots = [authPath, path.join(authPath, `session-${clientId}`)];
 
   function walk(dir, depth = 0) {
     if (depth > 3) return;
@@ -48,8 +47,6 @@ function clearStaleChromiumLocks() {
 
       if (lockNames.has(entry.name)) {
         try {
-          // Chromium's SingletonLock/Socket are often symlinks. existsSync()
-          // can return false for a broken symlink, so unlink directly instead.
           fs.unlinkSync(target);
           console.log(`Removed stale Chromium lock: ${target}`);
         } catch (err) {
@@ -60,9 +57,7 @@ function clearStaleChromiumLocks() {
         continue;
       }
 
-      if (entry.isDirectory()) {
-        walk(target, depth + 1);
-      }
+      if (entry.isDirectory()) walk(target, depth + 1);
     }
   }
 
@@ -79,7 +74,7 @@ const client = new Client({
   puppeteer: {
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     headless: true,
-    args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
   }
 });
 
@@ -90,11 +85,13 @@ client.on("qr", async qr => {
 });
 
 client.on("authenticated", () => console.log("WhatsApp authenticated"));
+
 client.on("ready", () => {
   waReady = true;
   qrDataUrl = null;
   console.log("WhatsApp ready");
 });
+
 client.on("disconnected", reason => {
   waReady = false;
   console.log("WhatsApp disconnected:", reason);
@@ -128,6 +125,7 @@ async function ensureSchema() {
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
+
   CREATE TABLE IF NOT EXISTS whatsapp_messages (
     id BIGSERIAL PRIMARY KEY,
     whatsapp_message_id TEXT UNIQUE NOT NULL,
@@ -141,6 +139,7 @@ async function ensureSchema() {
     raw JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );`;
+
   await pool.query(sql);
 }
 
@@ -149,11 +148,45 @@ function phoneFromChatId(id) {
   return m ? m[1] : null;
 }
 
-async function upsertRenter(chat, labels=[]) {
+async function withDetachedFrameRetry(fn, retries = 2) {
+  let lastErr;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err && (err.message || err));
+      const transient =
+        msg.includes("detached Frame") ||
+        msg.includes("Execution context was destroyed") ||
+        msg.includes("Target closed");
+
+      if (!transient || attempt === retries) throw err;
+
+      console.warn(`WhatsApp frame changed; retrying (${attempt + 1}/${retries})...`);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+  }
+
+  throw lastErr;
+}
+
+async function upsertRenter(chat, labels = []) {
   const id = chat.id._serialized;
-  const contact = await chat.getContact();
-  const displayName = chat.name || contact.pushname || contact.name || null;
+
+  let contact = null;
+  try {
+    contact = await withDetachedFrameRetry(() => chat.getContact(), 1);
+  } catch {}
+
+  const displayName =
+    chat.name ||
+    (contact && (contact.pushname || contact.name)) ||
+    null;
+
   const phone = phoneFromChatId(id);
+
   const { rows } = await pool.query(`
     INSERT INTO renters (whatsapp_chat_id, display_name, phone, labels)
     VALUES ($1,$2,$3,$4::jsonb)
@@ -164,19 +197,26 @@ async function upsertRenter(chat, labels=[]) {
       updated_at = NOW()
     RETURNING id
   `, [id, displayName, phone, JSON.stringify(labels)]);
+
   return rows[0].id;
 }
 
 async function saveMessage(chatId, renterId, message) {
-  const ts = message.timestamp ? new Date(message.timestamp * 1000) : new Date();
+  const ts = message.timestamp
+    ? new Date(message.timestamp * 1000)
+    : new Date();
+
   const direction = message.fromMe ? "outbound" : "inbound";
-  const serializedId = message.id && message.id._serialized
-    ? message.id._serialized
-    : `${chatId}:${message.timestamp}:${direction}`;
+
+  const serializedId =
+    message.id && message.id._serialized
+      ? message.id._serialized
+      : `${chatId}:${message.timestamp}:${direction}`;
 
   const result = await pool.query(`
     INSERT INTO whatsapp_messages
-      (whatsapp_message_id, whatsapp_chat_id, renter_id, direction, sender_name, body, message_type, message_at, raw)
+      (whatsapp_message_id, whatsapp_chat_id, renter_id, direction,
+       sender_name, body, message_type, message_at, raw)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
     ON CONFLICT (whatsapp_message_id) DO NOTHING
   `, [
@@ -196,6 +236,7 @@ async function saveMessage(chatId, renterId, message) {
       timestamp: message.timestamp
     })
   ]);
+
   return result.rowCount;
 }
 
@@ -212,25 +253,62 @@ async function updateRenterDates(renterId) {
       GROUP BY renter_id
     ) x
     WHERE r.id=x.renter_id
-  `,[renterId]);
+  `, [renterId]);
 }
 
-app.get("/", (req,res) => {
+app.get("/", (req, res) => {
   res.type("html").send(`
   <html>
     <head>
       <meta name="viewport" content="width=device-width">
       <style>
-        body{font-family:Arial;background:#f2eee3;color:#172922;padding:38px;max-width:900px;margin:auto}
-        h1{font-family:Georgia,serif;font-weight:400;font-size:44px}
-        .tag{color:#ba9251;text-transform:uppercase;letter-spacing:.12em;font-size:12px}
-        .box{background:#fff;padding:24px;border:1px solid #d8d1c4;margin:18px 0}
+        body{
+          font-family:Arial;
+          background:#f2eee3;
+          color:#172922;
+          padding:38px;
+          max-width:900px;
+          margin:auto
+        }
+        h1{
+          font-family:Georgia,serif;
+          font-weight:400;
+          font-size:44px
+        }
+        .tag{
+          color:#ba9251;
+          text-transform:uppercase;
+          letter-spacing:.12em;
+          font-size:12px
+        }
+        .box{
+          background:#fff;
+          padding:24px;
+          border:1px solid #d8d1c4;
+          margin:18px 0
+        }
         a{color:#15342c}
-        button{background:#17372e;color:white;border:0;padding:13px 20px;font-size:15px;cursor:pointer}
+        button{
+          background:#17372e;
+          color:white;
+          border:0;
+          padding:13px 20px;
+          font-size:15px;
+          cursor:pointer
+        }
         button:disabled{opacity:.5;cursor:not-allowed}
-        input{padding:10px;border:1px solid #cfc8bc;width:90px}
+        input{
+          padding:10px;
+          border:1px solid #cfc8bc;
+          width:90px
+        }
         label{display:inline-block;margin-right:18px}
-        pre{white-space:pre-wrap;background:#f7f4ee;padding:14px;border:1px solid #ddd5c8}
+        pre{
+          white-space:pre-wrap;
+          background:#f7f4ee;
+          padding:14px;
+          border:1px solid #ddd5c8
+        }
       </style>
     </head>
     <body>
@@ -248,11 +326,14 @@ app.get("/", (req,res) => {
       </div>
 
       <div class="box">
-        <h3>Test import: Tenants</h3>
-        <p>This imports only chats with the <b>Tenants</b> WhatsApp label.</p>
+        <h3>Import renter enquiries</h3>
+        <p>
+          Scans recent WhatsApp chats and imports only conversations carrying
+          the <b>Tenants</b> label.
+        </p>
 
         <label>
-          Chats
+          Matching chats
           <input id="limitChats" type="number" min="1" max="250" value="20">
         </label>
 
@@ -274,11 +355,15 @@ app.get("/", (req,res) => {
         async function runSync() {
           const btn = document.getElementById("syncBtn");
           const result = document.getElementById("result");
-          const limitChats = Number(document.getElementById("limitChats").value || 20);
-          const messagesPerChat = Number(document.getElementById("messagesPerChat").value || 150);
+
+          const limitChats =
+            Number(document.getElementById("limitChats").value || 20);
+
+          const messagesPerChat =
+            Number(document.getElementById("messagesPerChat").value || 150);
 
           btn.disabled = true;
-          result.textContent = "Syncing Tenants…";
+          result.textContent = "Scanning WhatsApp for Tenants-labelled chats…";
 
           try {
             const response = await fetch("/sync/chats", {
@@ -287,7 +372,8 @@ app.get("/", (req,res) => {
               body: JSON.stringify({
                 label: "Tenants",
                 limitChats,
-                messagesPerChat
+                messagesPerChat,
+                scanLimit: 250
               })
             });
 
@@ -304,17 +390,19 @@ app.get("/", (req,res) => {
   </html>`);
 });
 
-app.get("/qr", (req,res) => {
+app.get("/qr", (req, res) => {
   if (waReady) {
     return res.type("html").send(
       "<h2>WhatsApp is connected.</h2><p><a href='/'>Back</a></p>"
     );
   }
+
   if (!qrDataUrl) {
     return res.type("html").send(
       "<h2>Waiting for QR…</h2><meta http-equiv='refresh' content='3'>"
     );
   }
+
   res.type("html").send(`
     <h2>Scan with WhatsApp</h2>
     <img src="${qrDataUrl}" width="320">
@@ -323,172 +411,200 @@ app.get("/qr", (req,res) => {
   `);
 });
 
-app.get("/status", (req,res) => {
-  res.json({ ok:true, waReady, ...syncState });
+app.get("/status", (req, res) => {
+  res.json({ ok: true, waReady, ...syncState });
 });
 
-async function withDetachedFrameRetry(fn, retries = 2) {
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      const msg = String(err && (err.message || err));
-      const detached = msg.includes("detached Frame") || msg.includes("Execution context was destroyed");
-      if (!detached || attempt === retries) throw err;
-      console.warn(`WhatsApp frame changed; retrying (${attempt + 1}/${retries})...`);
-      await new Promise(resolve => setTimeout(resolve, 1500));
-    }
-  }
-  throw lastErr;
-}
-
-app.get("/labels", async (req,res) => {
+app.get("/labels", async (req, res) => {
   if (!waReady) {
-    return res.status(409).json({ ok:false, error:"WhatsApp not connected" });
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
   }
 
   try {
-    const labels = await withDetachedFrameRetry(async () => {
-      const labelObjects = await client.getLabels();
-      const result = [];
+    const labelObjects = await withDetachedFrameRetry(() => client.getLabels());
 
-      for (const label of labelObjects) {
-        let count = null;
-        try {
-          const chats = await label.getChats();
-          count = chats.filter(c => !c.isGroup).length;
-        } catch (err) {
-          const msg = String(err && (err.message || err));
-          if (msg.includes("detached Frame") || msg.includes("Execution context was destroyed")) {
-            throw err;
-          }
-          console.warn(`Could not count chats for label ${label.name}:`, msg);
-        }
+    const labels = labelObjects
+      .map(label => ({
+        id: label.id,
+        name: label.name || "(unnamed)"
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
 
-        result.push({
-          id: label.id,
-          name: label.name || "(unnamed)",
-          count
-        });
-      }
-
-      result.sort((a,b) =>
-        (Number(b.count || 0) - Number(a.count || 0)) ||
-        a.name.localeCompare(b.name)
-      );
-
-      return result;
-    });
-
-    res.json({ ok:true, labels });
+    res.json({ ok: true, labels });
   } catch (err) {
-    console.error("Label preview failed:", err);
-    res.status(500).json({ ok:false, error:String(err.message || err) });
+    const detail = String(err && (err.stack || err.message || err));
+    console.error("Label preview failed:", detail);
+
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err)),
+      detail
+    });
   }
 });
 
-app.post("/sync/chats", async (req,res) => {
+app.post("/sync/chats", async (req, res) => {
   if (!waReady) {
-    return res.status(409).json({ ok:false, error:"WhatsApp not connected" });
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
   }
+
   if (syncState.running) {
-    return res.status(409).json({ ok:false, error:"Sync already running" });
+    return res.status(409).json({
+      ok: false,
+      error: "Sync already running"
+    });
   }
 
   const body = req.body || {};
-  const limitChats = Math.max(1, Math.min(Number(body.limitChats || 50), 250));
-  const messagesPerChat = Math.max(10, Math.min(Number(body.messagesPerChat || 100), 500));
-  const labelFilter = String(body.label || "").trim().toLowerCase();
+
+  const limitChats = Math.max(
+    1,
+    Math.min(Number(body.limitChats || 20), 250)
+  );
+
+  const messagesPerChat = Math.max(
+    10,
+    Math.min(Number(body.messagesPerChat || 150), 500)
+  );
+
+  const scanLimit = Math.max(
+    limitChats,
+    Math.min(Number(body.scanLimit || 250), 1000)
+  );
+
+  const labelFilter =
+    String(body.label || "Tenants").trim().toLowerCase();
 
   syncState.running = true;
+
   let chatsSeen = 0;
   let messagesSaved = 0;
+  let chatsScanned = 0;
 
   try {
-    const candidates = [];
+    const allChats =
+      await withDetachedFrameRetry(() => client.getChats());
 
-    if (labelFilter) {
-      const labelObjects = await withDetachedFrameRetry(() => client.getLabels());
-      const matchedLabel = labelObjects.find(
-        x => String(x.name || "").trim().toLowerCase() === labelFilter
-      );
+    const directChats = allChats
+      .filter(chat => !chat.isGroup)
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-      if (!matchedLabel) {
-        syncState.running = false;
-        return res.status(404).json({
-          ok:false,
-          error:`WhatsApp label not found: ${body.label}`
-        });
+    const selected = [];
+
+    for (const chat of directChats.slice(0, scanLimit)) {
+      chatsScanned++;
+
+      try {
+        const chatLabels = await withDetachedFrameRetry(
+          () => client.getChatLabels(chat.id._serialized),
+          2
+        );
+
+        const labelNames =
+          chatLabels.map(label => label.name).filter(Boolean);
+
+        const isMatch = labelNames.some(
+          name =>
+            String(name).trim().toLowerCase() === labelFilter
+        );
+
+        if (isMatch) {
+          selected.push({
+            chat,
+            labels: labelNames
+          });
+
+          if (selected.length >= limitChats) break;
+        }
+      } catch (err) {
+        console.warn(
+          `Could not read labels for ${chat.id && chat.id._serialized}:`,
+          String(err && (err.message || err))
+        );
       }
 
-      const chats = await withDetachedFrameRetry(() => matchedLabel.getChats());
-      for (const chat of chats.filter(c => !c.isGroup)) {
-        candidates.push({ chat, labels:[matchedLabel.name] });
-      }
-    } else {
-      const chats = await withDetachedFrameRetry(() => client.getChats());
-      for (const chat of chats.filter(c => !c.isGroup)) {
-        let labels = [];
-        try {
-          const chatLabels = await withDetachedFrameRetry(() => chat.getLabels(), 1);
-          labels = chatLabels.map(x => x.name);
-        } catch {}
-        candidates.push({ chat, labels });
-      }
+      await new Promise(resolve => setTimeout(resolve, 80));
     }
-
-    const selected = candidates
-      .sort((a,b) => (b.chat.timestamp || 0) - (a.chat.timestamp || 0))
-      .slice(0, limitChats);
 
     for (const { chat, labels } of selected) {
       chatsSeen++;
 
-      const renterId = await upsertRenter(chat, labels);
-      const messages = await chat.fetchMessages({ limit: messagesPerChat });
+      try {
+        const renterId = await upsertRenter(chat, labels);
 
-      for (const message of messages) {
-        messagesSaved += await saveMessage(
-          chat.id._serialized,
-          renterId,
-          message
+        const messages = await withDetachedFrameRetry(
+          () => chat.fetchMessages({ limit: messagesPerChat }),
+          2
+        );
+
+        for (const message of messages) {
+          messagesSaved +=
+            await saveMessage(
+              chat.id._serialized,
+              renterId,
+              message
+            );
+        }
+
+        await updateRenterDates(renterId);
+      } catch (err) {
+        console.warn(
+          `Could not import chat ${chat.id && chat.id._serialized}:`,
+          String(err && (err.stack || err.message || err))
         );
       }
-
-      await updateRenterDates(renterId);
     }
 
     syncState = {
-      running:false,
-      lastSync:new Date().toISOString(),
+      running: false,
+      lastSync: new Date().toISOString(),
       chatsSeen,
       messagesSaved
     };
 
     res.json({
-      ok:true,
-      label: labelFilter || null,
+      ok: true,
+      label: body.label || "Tenants",
+      chatsScanned,
+      matchingChatsFound: selected.length,
       ...syncState
     });
-
   } catch (err) {
     syncState.running = false;
-    console.error(err);
-    res.status(500).json({ ok:false, error:String(err.message || err) });
+
+    const detail =
+      String(err && (err.stack || err.message || err));
+
+    console.error("Sync failed:", detail);
+
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err)),
+      detail
+    });
   }
 });
 
-const port = process.env.PORT || process.env.READER_PORT || 3001;
+const port =
+  process.env.PORT ||
+  process.env.READER_PORT ||
+  3001;
 
 ensureSchema()
   .then(() => client.initialize())
-  .then(() => app.listen(
-    port,
-    "0.0.0.0",
-    () => console.log(`Reader listening on ${port}`)
-  ))
+  .then(() =>
+    app.listen(
+      port,
+      "0.0.0.0",
+      () => console.log(`Reader listening on ${port}`)
+    )
+  )
   .catch(err => {
     console.error("Startup failed:", err);
     process.exit(1);

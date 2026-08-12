@@ -1,30 +1,20 @@
-Zheungyuan Rentals – Browser Sync Update
-
-Replace:
+Replace GitHub file:
 reader/server.js
 
-with this version and commit to main.
+with this server.js and commit to main.
 
-This keeps:
-- WhatsApp QR / LocalAuth
-- Railway Chromium lock cleanup
-- detached-frame retry
-- /labels
-- label-filtered /sync/chats
+This version:
+- keeps the existing WhatsApp session/QR setup
+- keeps the Railway Chromium lock cleanup
+- keeps detached-frame retry handling
+- avoids label.getChats()/getChatsByLabelId(), which was producing the cryptic "r" error
+- scans recent direct chats and checks each chat's labels
+- imports only chats labelled "Tenants"
+- adds a "Sync Tenants" button to the reader homepage
+- returns much better error detail if a chat fails
 
-It adds a simple browser button on the reader home page:
-"Sync Tenants"
-
-Defaults:
-- 20 chats
-- 150 messages per chat
-- label = Tenants
-
-After Railway redeploys:
-1. Open the whatsapp-reader home URL.
+After Railway redeploy:
+1. Open the reader homepage.
 2. Confirm Status = Connected.
-3. Click "Sync Tenants".
-4. Copy the JSON result shown on the page and send it to ChatGPT.
-5. Then open the Zheungyuan /admin dashboard.
-
-No curl or terminal command is required.
+3. Click Sync Tenants.
+4. Send the JSON shown below the button.
