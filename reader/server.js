@@ -267,41 +267,64 @@ app.get("/status", (req,res) => {
   res.json({ ok:true, waReady, ...syncState });
 });
 
+async function withDetachedFrameRetry(fn, retries = 2) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err && (err.message || err));
+      const detached = msg.includes("detached Frame") || msg.includes("Execution context was destroyed");
+      if (!detached || attempt === retries) throw err;
+      console.warn(`WhatsApp frame changed; retrying (${attempt + 1}/${retries})...`);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+  }
+  throw lastErr;
+}
+
 app.get("/labels", async (req,res) => {
   if (!waReady) {
     return res.status(409).json({ ok:false, error:"WhatsApp not connected" });
   }
 
   try {
-    const chats = await client.getChats();
-    const directChats = chats.filter(c => !c.isGroup);
-    const counts = new Map();
-    let labelledChats = 0;
+    const labels = await withDetachedFrameRetry(async () => {
+      const labelObjects = await client.getLabels();
+      const result = [];
 
-    for (const chat of directChats) {
-      try {
-        const labelObjects = await chat.getLabels();
-        if (labelObjects.length) labelledChats++;
-
-        for (const label of labelObjects) {
-          const name = label.name || "(unnamed)";
-          counts.set(name, (counts.get(name) || 0) + 1);
+      for (const label of labelObjects) {
+        let count = null;
+        try {
+          const chats = await label.getChats();
+          count = chats.filter(c => !c.isGroup).length;
+        } catch (err) {
+          const msg = String(err && (err.message || err));
+          if (msg.includes("detached Frame") || msg.includes("Execution context was destroyed")) {
+            throw err;
+          }
+          console.warn(`Could not count chats for label ${label.name}:`, msg);
         }
-      } catch {}
-    }
 
-    const labels = [...counts.entries()]
-      .map(([name,count]) => ({ name, count }))
-      .sort((a,b) => b.count - a.count || a.name.localeCompare(b.name));
+        result.push({
+          id: label.id,
+          name: label.name || "(unnamed)",
+          count
+        });
+      }
 
-    res.json({
-      ok:true,
-      totalChats:directChats.length,
-      labelledChats,
-      labels
+      result.sort((a,b) =>
+        (Number(b.count || 0) - Number(a.count || 0)) ||
+        a.name.localeCompare(b.name)
+      );
+
+      return result;
     });
+
+    res.json({ ok:true, labels });
   } catch (err) {
-    console.error(err);
+    console.error("Label preview failed:", err);
     res.status(500).json({ ok:false, error:String(err.message || err) });
   }
 });
@@ -324,25 +347,36 @@ app.post("/sync/chats", async (req,res) => {
   let messagesSaved = 0;
 
   try {
-    const chats = await client.getChats();
     const candidates = [];
 
-    for (const chat of chats.filter(c => !c.isGroup)) {
-      let labels = [];
+    if (labelFilter) {
+      const labelObjects = await withDetachedFrameRetry(() => client.getLabels());
+      const matchedLabel = labelObjects.find(
+        x => String(x.name || "").trim().toLowerCase() === labelFilter
+      );
 
-      try {
-        const labelObjects = await chat.getLabels();
-        labels = labelObjects.map(x => x.name);
-      } catch {}
-
-      if (
-        labelFilter &&
-        !labels.some(x => String(x).toLowerCase() === labelFilter)
-      ) {
-        continue;
+      if (!matchedLabel) {
+        syncState.running = false;
+        return res.status(404).json({
+          ok:false,
+          error:`WhatsApp label not found: ${body.label}`
+        });
       }
 
-      candidates.push({ chat, labels });
+      const chats = await withDetachedFrameRetry(() => matchedLabel.getChats());
+      for (const chat of chats.filter(c => !c.isGroup)) {
+        candidates.push({ chat, labels:[matchedLabel.name] });
+      }
+    } else {
+      const chats = await withDetachedFrameRetry(() => client.getChats());
+      for (const chat of chats.filter(c => !c.isGroup)) {
+        let labels = [];
+        try {
+          const chatLabels = await withDetachedFrameRetry(() => chat.getLabels(), 1);
+          labels = chatLabels.map(x => x.name);
+        } catch {}
+        candidates.push({ chat, labels });
+      }
     }
 
     const selected = candidates
