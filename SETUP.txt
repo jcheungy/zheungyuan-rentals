@@ -70,3 +70,28 @@ Do NOT delete:
 - READER_GPT_KEY
 - Dockerfile
 - whatsapp-web.js patches
+
+
+V2.1 — FIND THE UNLABELLED HISTORICAL RENTERS
+
+Why only 8 renters appeared:
+The earlier importer selected only chats carrying recognised WhatsApp labels.
+Only 8 chats were classified as renter_prospect, so the Renters page correctly
+showed 8.
+
+To discover the hundreds of historical enquiries:
+1. Deploy reader/server.js from this package.
+2. Open the whatsapp-reader homepage.
+3. Click "Import ALL direct chats + ALL messages".
+4. Wait until discovery status shows running=false.
+5. Then ask the GPT:
+   "Rebuild the CRM from all imported contacts. Review every contact and every
+    message. Classify genuine property enquiries as renter_prospect even if
+    they were unlabelled; classify non-rental/private chats as unrelated. Save
+    every classification and renter analysis. Continue until complete."
+6. Refresh /admin. The renter count will rise only as GPT classifies contacts.
+
+WARNING:
+This discovery import intentionally imports all one-to-one chats, including
+unlabelled personal chats, because it is the only reliable way to find old
+rental enquiries that were never labelled. Groups are excluded.

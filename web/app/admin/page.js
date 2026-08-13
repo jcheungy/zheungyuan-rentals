@@ -10,6 +10,8 @@ async function data() {
       COUNT(*) FILTER (WHERE contact_type='landlord')::int landlords,
       COUNT(*) FILTER (WHERE contact_type='agent')::int agents,
       COUNT(*) FILTER (WHERE contact_type='existing_tenant')::int tenants,
+      COUNT(*) FILTER (WHERE contact_type='unknown')::int unknown,
+      COUNT(*) FILTER (WHERE classification_updated_at IS NULL)::int unreviewed,
       COUNT(*) FILTER (WHERE classification_updated_at IS NOT NULL)::int reviewed
     FROM renters
     WHERE contact_type <> 'unrelated'
@@ -40,7 +42,7 @@ async function data() {
 
 export default async function Admin() {
   let d = {
-    c: {total:0,renters:0,landlords:0,agents:0,tenants:0,reviewed:0},
+    c: {total:0,renters:0,landlords:0,agents:0,tenants:0,unknown:0,unreviewed:0,reviewed:0},
     messages:0,
     properties:{total:0,available:0},
     matches:0
@@ -65,6 +67,8 @@ export default async function Admin() {
         <div className="crm-panel"><span>Properties</span><div className="crm-count">{d.properties.total}</div></div>
         <div className="crm-panel"><span>Available properties</span><div className="crm-count">{d.properties.available}</div></div>
         <div className="crm-panel"><span>Saved matches</span><div className="crm-count">{d.matches}</div></div>
+        <div className="crm-panel"><span>Unclassified contacts</span><div className="crm-count">{d.c.unknown}</div></div>
+        <div className="crm-panel"><span>Awaiting GPT review</span><div className="crm-count">{d.c.unreviewed}</div></div>
         <div className="crm-panel"><span>GPT reviewed contacts</span><div className="crm-count">{d.c.reviewed}</div></div>
       </div>
 

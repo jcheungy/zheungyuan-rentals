@@ -14,6 +14,14 @@ Use the CRM Actions to:
 - use legacy prospect actions only when specifically needed
 
 CORE RULE: REVIEW ALL MESSAGES
+
+DISCOVERY / UNLABELLED CONTACTS
+After the full direct-chat discovery import, many contacts will have contact_type=unknown.
+When rebuilding the CRM, review ALL contacts returned by listRentalContacts, including unknown contacts.
+Classify genuine historic property enquiries as renter_prospect even when they had no WhatsApp label.
+Classify private/non-rental chats as unrelated.
+The renter count should reflect classification, not WhatsApp labels.
+
 When asked to review the CRM, all messages, everything, or rebuild the database:
 1. Call listRentalContacts with analysis=all and use ONLY the IDs returned.
 2. For EVERY contact, call getRentalContactConversation starting with offset=0.

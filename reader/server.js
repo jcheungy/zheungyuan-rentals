@@ -39,6 +39,19 @@ let bulkImportState = {
   error: null
 };
 
+let discoveryImportState = {
+  running: false,
+  startedAt: null,
+  completedAt: null,
+  chatsScanned: 0,
+  directChatsFound: 0,
+  contactsProcessed: 0,
+  messagesRead: 0,
+  newMessagesSaved: 0,
+  currentContact: null,
+  error: null
+};
+
 const authPath = process.env.WA_AUTH_PATH || "./.wwebjs_auth";
 const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
 const gptKey = process.env.READER_GPT_KEY || "";
@@ -1447,6 +1460,167 @@ app.post("/gpt/matches", requireGptAuth, async (req, res) => {
   }
 });
 
+
+/*
+ * Full-account discovery import.
+ * This intentionally scans EVERY direct (non-group) WhatsApp chat, including
+ * unlabelled chats, so the GPT can classify old rental enquiries that were
+ * never given a WhatsApp label.
+ *
+ * Existing message IDs are deduplicated by whatsapp_messages.whatsapp_message_id,
+ * so this import is safe to rerun.
+ */
+async function runFullDiscoveryImport() {
+  discoveryImportState = {
+    running: true,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    chatsScanned: 0,
+    directChatsFound: 0,
+    contactsProcessed: 0,
+    messagesRead: 0,
+    newMessagesSaved: 0,
+    currentContact: null,
+    error: null
+  };
+
+  try {
+    const allChats = await withDetachedFrameRetry(
+      () => client.getChats()
+    );
+
+    const directChats = allChats
+      .filter(chat => !chat.isGroup)
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    discoveryImportState.directChatsFound = directChats.length;
+
+    for (const chat of directChats) {
+      discoveryImportState.chatsScanned++;
+
+      const chatId =
+        chat && chat.id && chat.id._serialized
+          ? chat.id._serialized
+          : "";
+
+      discoveryImportState.currentContact =
+        chat.name || phoneFromChatId(chatId) || chatId || "Unknown";
+
+      try {
+        let labelNames = [];
+
+        try {
+          const chatLabels = await withDetachedFrameRetry(
+            () => client.getChatLabels(chatId),
+            2
+          );
+
+          labelNames = chatLabels
+            .map(label => label.name)
+            .filter(Boolean);
+        } catch (err) {
+          console.warn(
+            `Could not read labels for discovery chat ${chatId}:`,
+            String(err && (err.message || err))
+          );
+        }
+
+        const suggestedType = inferTypeFromLabels(labelNames);
+
+        const contactId = await upsertContact(
+          chat,
+          labelNames,
+          suggestedType
+        );
+
+        const messages = await withDetachedFrameRetry(
+          () => chat.fetchMessages({ limit: Infinity }),
+          2
+        );
+
+        discoveryImportState.messagesRead += messages.length;
+
+        for (const message of messages) {
+          discoveryImportState.newMessagesSaved += await saveMessage(
+            chatId,
+            contactId,
+            message
+          );
+        }
+
+        await updateContactDates(contactId);
+        discoveryImportState.contactsProcessed++;
+      } catch (err) {
+        console.warn(
+          `Could not discovery-import chat ${chatId}:`,
+          String(err && (err.stack || err.message || err))
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+
+    discoveryImportState.running = false;
+    discoveryImportState.currentContact = null;
+    discoveryImportState.completedAt = new Date().toISOString();
+
+    console.log(
+      `Discovery import complete: ${discoveryImportState.contactsProcessed} contacts, ` +
+      `${discoveryImportState.messagesRead} messages read, ` +
+      `${discoveryImportState.newMessagesSaved} new messages saved`
+    );
+  } catch (err) {
+    discoveryImportState.running = false;
+    discoveryImportState.currentContact = null;
+    discoveryImportState.completedAt = new Date().toISOString();
+    discoveryImportState.error = String(
+      err && (err.stack || err.message || err)
+    );
+
+    console.error(
+      "Full direct-chat discovery import failed:",
+      discoveryImportState.error
+    );
+  }
+}
+
+app.post("/sync/discovery/all", async (req, res) => {
+  if (!waReady) {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
+  }
+
+  if (
+    syncState.running ||
+    bulkImportState.running ||
+    discoveryImportState.running
+  ) {
+    return res.status(409).json({
+      ok: false,
+      error: "A WhatsApp import is already running"
+    });
+  }
+
+  runFullDiscoveryImport();
+
+  return res.status(202).json({
+    ok: true,
+    started: true,
+    message:
+      "Full direct-chat discovery import started. Every non-group chat and its complete available message history will be imported for later GPT classification."
+  });
+});
+
+app.get("/sync/discovery/all/status", (req, res) => {
+  res.json({
+    ok: true,
+    ...discoveryImportState
+  });
+});
+
+
 /* ---------------- WhatsApp import ---------------- */
 
 async function findChatsByLabels({
@@ -1660,7 +1834,7 @@ app.post("/sync/crm/all", async (req, res) => {
     });
   }
 
-  if (syncState.running || bulkImportState.running) {
+  if (syncState.running || bulkImportState.running || discoveryImportState.running) {
     return res.status(409).json({
       ok: false,
       error: "A WhatsApp import is already running"
@@ -1758,7 +1932,7 @@ app.post("/sync/prospects", async (req, res) => {
     });
   }
 
-  if (syncState.running || bulkImportState.running) {
+  if (syncState.running || bulkImportState.running || discoveryImportState.running) {
     return res.status(409).json({
       ok: false,
       error: "Sync already running"
@@ -1916,7 +2090,7 @@ app.post("/sync/prospects/all", async (req, res) => {
     });
   }
 
-  if (syncState.running || bulkImportState.running) {
+  if (syncState.running || bulkImportState.running || discoveryImportState.running) {
     return res.status(409).json({
       ok: false,
       error: "A WhatsApp import is already running"
@@ -2019,6 +2193,35 @@ app.get("/", (req, res) => {
       </div>
 
       <div class="box">
+        <h3>Discover ALL direct chats</h3>
+        <p>
+          Your historical renter enquiries were not all labelled in WhatsApp.
+          This scans <b>every non-group chat</b>, imports its complete available
+          message history, and leaves unlabelled contacts as <b>unknown</b> so
+          the private GPT can classify them.
+        </p>
+
+        <div class="warn">
+          This is broader than the labelled CRM import and can include personal
+          one-to-one chats. Use it only because you want the GPT to discover old
+          rental enquiries that were never labelled. The GPT should classify
+          unrelated contacts as <b>unrelated</b>.
+        </div>
+
+        <div style="margin-top:18px">
+          <button
+            id="discoveryBtn"
+            onclick="startDiscoveryImport()"
+            ${waReady ? "" : "disabled"}
+          >
+            Import ALL direct chats + ALL messages
+          </button>
+        </div>
+
+        <pre id="discoveryResult">Discovery import has not been started.</pre>
+      </div>
+
+      <div class="box">
         <h3>Full rental CRM import</h3>
         <p>
           Imports the complete available message history from chats carrying
@@ -2095,6 +2298,61 @@ app.get("/", (req, res) => {
           await refreshCrmStatus();
         }
 
+
+        let discoveryTimer = null;
+
+        async function refreshDiscoveryStatus() {
+          const result = document.getElementById("discoveryResult");
+          const btn = document.getElementById("discoveryBtn");
+
+          try {
+            const response = await fetch("/sync/discovery/all/status");
+            const data = await response.json();
+            result.textContent = JSON.stringify(data, null, 2);
+
+            if (data.running) {
+              btn.disabled = true;
+              if (!discoveryTimer) {
+                discoveryTimer = setInterval(
+                  refreshDiscoveryStatus,
+                  3000
+                );
+              }
+            } else {
+              btn.disabled = false;
+              if (discoveryTimer) {
+                clearInterval(discoveryTimer);
+                discoveryTimer = null;
+              }
+            }
+          } catch (err) {
+            result.textContent =
+              "Discovery status error: " + err.message;
+          }
+        }
+
+        async function startDiscoveryImport() {
+          const ok = window.confirm(
+            "This will import EVERY direct non-group WhatsApp chat and its complete available history, including unlabelled/personal chats, so GPT can find historical rental enquiries. Continue?"
+          );
+          if (!ok) return;
+
+          document.getElementById("discoveryBtn").disabled = true;
+
+          const response = await fetch("/sync/discovery/all", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"}
+          });
+
+          const data = await response.json();
+          document.getElementById("discoveryResult").textContent =
+            JSON.stringify(data, null, 2);
+
+          await refreshDiscoveryStatus();
+        }
+
+        refreshDiscoveryStatus();
+
         refreshCrmStatus();
       </script>
     </body>
@@ -2127,6 +2385,7 @@ app.get("/status", (req, res) => {
     waReady,
     sync: syncState,
     bulkImport: bulkImportState,
+    discoveryImport: discoveryImportState,
     crmImportLabels: CRM_IMPORT_LABELS
   });
 });
