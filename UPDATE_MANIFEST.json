@@ -1,0 +1,18 @@
+{
+  "version": "custom-gpt-real-property-photos-1",
+  "reader_changes": [
+    "private bearer-authenticated Custom GPT bridge",
+    "list prospect records",
+    "read stored conversations",
+    "save structured renter analysis",
+    "analysis audit fields"
+  ],
+  "web_changes": [
+    "replace stock imagery with uploaded real village-house photography",
+    "improved prospect-analysis dashboard"
+  ],
+  "required_env": [
+    "READER_GPT_KEY"
+  ],
+  "openai_api_key_required": false
+}

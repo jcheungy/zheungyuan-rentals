@@ -505,3 +505,31 @@ th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#6f756f}
   .zy-footer-grid{grid-template-columns:1fr;gap:15px}
   .cards{grid-template-columns:1fr}
 }
+
+
+/* Structured prospect-analysis dashboard */
+.lead-main{min-width:280px}
+.lead-name{font-weight:700;margin-bottom:5px}
+.lead-phone,.muted-small{color:#7b817d;font-size:11px}
+.lead-summary{max-width:430px;line-height:1.5;color:#4f5c56}
+.lead-meta{margin-top:7px;color:#7b817d;font-size:11px;line-height:1.45}
+.mini-tags{display:flex;flex-wrap:wrap;gap:5px;min-width:210px}
+.mini-tag{
+  display:inline-block;
+  border:1px solid #d8d1c4;
+  border-radius:999px;
+  padding:5px 8px;
+  background:#fbf8f1;
+  color:#53615a;
+  font-size:10px;
+}
+.confidence{display:block;margin-top:7px;color:#8a7653;font-size:10px}
+.admin-note{
+  margin:22px 0;
+  padding:15px 18px;
+  border-left:3px solid var(--gold);
+  background:#f4efe5;
+  color:#5d6862;
+  font-size:12px;
+  line-height:1.55;
+}

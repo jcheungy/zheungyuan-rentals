@@ -1,30 +1,27 @@
 const sampleHomes = [
   {
-    location: "Yuen Long",
-    title: "Garden village home",
-    meta: "Ground floor · Approx. 700 sq ft",
-    price: "Sample presentation",
-    image:
-      "https://images.unsplash.com/photo-1721222205941-21b2eee40652?auto=format&fit=crop&fm=jpg&q=82&w=1600",
-    tags: ["Garden", "Pet friendly", "Parking"],
+    location: "Village-house portfolio",
+    title: "Contemporary village-house exterior",
+    meta: "Real 張園 portfolio photography",
+    price: "Portfolio property",
+    image: "/images/zheungyuan/village-house-exterior.webp",
+    tags: ["Village house", "Parking", "Balconies"],
   },
   {
-    location: "New Territories",
-    title: "Bright modern village home",
-    meta: "Upper floor · Approx. 700 sq ft",
-    price: "Sample presentation",
-    image:
-      "https://images.unsplash.com/photo-1742490382029-98357c08f3cd?auto=format&fit=crop&fm=jpg&q=82&w=1600",
-    tags: ["Bright interior", "Balcony", "Quiet"],
+    location: "Village-house portfolio",
+    title: "Modern fitted kitchen",
+    meta: "Real 張園 portfolio photography",
+    price: "Portfolio property",
+    image: "/images/zheungyuan/village-house-kitchen.webp",
+    tags: ["Open-plan", "Fitted kitchen", "Modern finish"],
   },
   {
-    location: "Yuen Long",
-    title: "Rooftop living",
-    meta: "Top floor · Private roof",
-    price: "Sample presentation",
-    image:
-      "https://images.unsplash.com/photo-1760709584989-79996c89255c?auto=format&fit=crop&fm=jpg&q=82&w=1600",
-    tags: ["Rooftop", "Open view", "Outdoor space"],
+    location: "Village-house portfolio",
+    title: "Light-filled internal staircase",
+    meta: "Real 張園 portfolio photography",
+    price: "Portfolio property",
+    image: "/images/zheungyuan/village-house-staircase.webp",
+    tags: ["Internal stairs", "Natural light", "Glass balustrade"],
   },
 ];
 
@@ -66,8 +63,8 @@ export default function Home() {
       <section className="zy-hero">
         <img
           className="zy-hero-photo"
-          src="https://images.unsplash.com/photo-1600566753190-17f0baa2a6c3?auto=format&fit=crop&q=88&w=2200"
-          alt="Contemporary home exterior"
+          src="/images/zheungyuan/village-house-exterior.webp"
+          alt="Real contemporary Hong Kong village house from the 張園 property portfolio"
         />
         <div className="zy-hero-shade" />
 
@@ -155,8 +152,8 @@ export default function Home() {
 
           <div className="zy-editorial-media">
             <img
-              src="https://images.unsplash.com/photo-1600210492486-724fe5c67fb0?auto=format&fit=crop&q=86&w=1600"
-              alt="Bright modern living room"
+              src="/images/zheungyuan/village-house-living-room.webp"
+              alt="Bright village-house living room from the 張園 property portfolio"
             />
             <div className="zy-media-label">
               <span>Presentation matters</span>
@@ -174,9 +171,9 @@ export default function Home() {
               <h2>Homes shown like homes.</h2>
             </div>
             <p>
-              These are presentation examples for now. Real 張園 listings and
-              property photography can replace them as the landlord portfolio
-              grows.
+              These photographs are from real village houses in the 張園
+              property portfolio. Live rental prices and availability will be
+              added separately as listings go online.
             </p>
           </div>
 
@@ -206,9 +203,10 @@ export default function Home() {
           </div>
 
           <div className="zy-sample-note">
-            <span>Preview only</span>
-            Sample imagery and listing details are being used to establish the
-            張園 visual language before the real property portfolio is added.
+            <span>Real property photography</span>
+            The homes shown here are genuine portfolio references. They are
+            being used to establish the 張園 presentation standard; they are
+            not being advertised here as currently available rentals.
           </div>
         </div>
       </section>
@@ -309,8 +307,8 @@ export default function Home() {
       <section className="zy-contact" id="contact">
         <div className="zy-contact-photo">
           <img
-            src="https://images.unsplash.com/photo-1744858207706-dd827060504d?auto=format&fit=crop&fm=jpg&q=82&w=2000"
-            alt="Contemporary home with landscaped garden"
+            src="/images/zheungyuan/village-house-kitchen.webp"
+            alt="Modern fitted kitchen in a real village house"
           />
         </div>
         <div className="container zy-contact-inner">

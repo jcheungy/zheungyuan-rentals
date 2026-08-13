@@ -24,6 +24,7 @@ let syncState = {
 
 const authPath = process.env.WA_AUTH_PATH || "./.wwebjs_auth";
 const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
+const gptKey = process.env.READER_GPT_KEY || "";
 
 function clearStaleChromiumLocks() {
   const lockNames = new Set(["SingletonLock", "SingletonSocket", "SingletonCookie"]);
@@ -122,6 +123,10 @@ async function ensureSchema() {
     requirement_summary TEXT,
     status TEXT NOT NULL DEFAULT 'unknown',
     contact_type TEXT NOT NULL DEFAULT 'unknown',
+    analysis_confidence DOUBLE PRECISION,
+    analysis_notes TEXT,
+    analysis_source TEXT,
+    analysis_updated_at TIMESTAMPTZ,
     labels JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -143,6 +148,18 @@ async function ensureSchema() {
 
   ALTER TABLE renters
     ADD COLUMN IF NOT EXISTS contact_type TEXT NOT NULL DEFAULT 'unknown';
+
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS analysis_confidence DOUBLE PRECISION;
+
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS analysis_notes TEXT;
+
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS analysis_source TEXT;
+
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS analysis_updated_at TIMESTAMPTZ;
 
   UPDATE renters
   SET contact_type = 'existing_tenant',
@@ -273,6 +290,412 @@ async function updateRenterDates(renterId) {
   `, [renterId]);
 }
 
+
+
+function requireGptAuth(req, res, next) {
+  if (!gptKey) {
+    return res.status(503).json({
+      ok: false,
+      error: "Custom GPT bridge is not configured"
+    });
+  }
+
+  const auth = String(req.headers.authorization || "");
+  if (auth !== `Bearer ${gptKey}`) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized"
+    });
+  }
+
+  next();
+}
+
+function nullableString(value, maxLength = 2000) {
+  if (value === null || value === undefined || value === "") return null;
+  return String(value).trim().slice(0, maxLength) || null;
+}
+
+function nullableInteger(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n);
+}
+
+function nullableBoolean(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return null;
+}
+
+function nullableDate(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const s = String(value).trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+function nullableConfidence(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(1, n));
+}
+
+/*
+ * Private Custom GPT bridge.
+ * These endpoints read only imported prospective-renter records and their
+ * stored WhatsApp messages. They do not control WhatsApp or send messages.
+ */
+app.get("/gpt/health", requireGptAuth, async (req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({
+      ok: true,
+      service: "zheungyuan-rental-crm",
+      gptBridge: true
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.get("/gpt/prospects", requireGptAuth, async (req, res) => {
+  const limit = Math.max(
+    1,
+    Math.min(Number(req.query.limit || 25), 100)
+  );
+
+  const analysis = String(req.query.analysis || "unreviewed")
+    .trim()
+    .toLowerCase();
+
+  const status = nullableString(req.query.status, 40);
+
+  const where = ["r.contact_type = 'renter_prospect'"];
+  const values = [];
+
+  if (analysis === "unreviewed") {
+    where.push("r.analysis_updated_at IS NULL");
+  } else if (analysis === "analysed" || analysis === "analyzed") {
+    where.push("r.analysis_updated_at IS NOT NULL");
+  }
+
+  if (status) {
+    values.push(status);
+    where.push(`r.status = $${values.length}`);
+  }
+
+  values.push(limit);
+  const limitPos = values.length;
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        r.id,
+        r.display_name,
+        r.phone,
+        r.first_enquiry_at,
+        r.last_message_at,
+        r.area_wanted,
+        r.budget_min,
+        r.budget_max,
+        r.bedrooms,
+        r.preferred_floor,
+        r.wants_garden,
+        r.wants_rooftop,
+        r.pets_required,
+        r.pet_details,
+        r.parking_needed,
+        r.move_in_date,
+        r.occupants,
+        r.source_property,
+        r.requirement_summary,
+        r.status,
+        r.labels,
+        r.analysis_confidence,
+        r.analysis_notes,
+        r.analysis_source,
+        r.analysis_updated_at,
+        (
+          SELECT COUNT(*)::int
+          FROM whatsapp_messages wm
+          WHERE wm.renter_id = r.id
+        ) AS message_count
+      FROM renters r
+      WHERE ${where.join(" AND ")}
+      ORDER BY
+        r.analysis_updated_at ASC NULLS FIRST,
+        r.last_message_at DESC NULLS LAST,
+        r.id DESC
+      LIMIT $${limitPos}
+    `, values);
+
+    res.json({
+      ok: true,
+      count: rows.length,
+      analysis,
+      prospects: rows
+    });
+  } catch (err) {
+    console.error("GPT prospect list failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.get(
+  "/gpt/prospects/:id/conversation",
+  requireGptAuth,
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid prospect id"
+      });
+    }
+
+    const limit = Math.max(
+      20,
+      Math.min(Number(req.query.limit || 250), 500)
+    );
+
+    try {
+      const prospectResult = await pool.query(`
+        SELECT
+          id,
+          display_name,
+          phone,
+          first_enquiry_at,
+          last_message_at,
+          labels,
+          status,
+          area_wanted,
+          budget_min,
+          budget_max,
+          bedrooms,
+          preferred_floor,
+          wants_garden,
+          wants_rooftop,
+          pets_required,
+          pet_details,
+          parking_needed,
+          move_in_date,
+          occupants,
+          source_property,
+          requirement_summary,
+          analysis_confidence,
+          analysis_notes,
+          analysis_updated_at
+        FROM renters
+        WHERE id = $1
+          AND contact_type = 'renter_prospect'
+      `, [id]);
+
+      if (!prospectResult.rows.length) {
+        return res.status(404).json({
+          ok: false,
+          error: "Prospect not found"
+        });
+      }
+
+      const messagesResult = await pool.query(`
+        SELECT direction, body, message_type, message_at
+        FROM (
+          SELECT direction, body, message_type, message_at, id
+          FROM whatsapp_messages
+          WHERE renter_id = $1
+          ORDER BY message_at DESC NULLS LAST, id DESC
+          LIMIT $2
+        ) recent
+        ORDER BY message_at ASC NULLS FIRST, id ASC
+      `, [id, limit]);
+
+      res.json({
+        ok: true,
+        prospect: prospectResult.rows[0],
+        messageCount: messagesResult.rows.length,
+        messages: messagesResult.rows
+      });
+    } catch (err) {
+      console.error("GPT conversation fetch failed:", err);
+      res.status(500).json({
+        ok: false,
+        error: String(err && (err.message || err))
+      });
+    }
+  }
+);
+
+app.post(
+  "/gpt/prospects/:id/analysis",
+  requireGptAuth,
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid prospect id"
+      });
+    }
+
+    const body = req.body || {};
+    const validStatuses = new Set([
+      "active",
+      "historical",
+      "closed",
+      "unknown",
+      "not_prospect"
+    ]);
+
+    const status =
+      body.status == null
+        ? null
+        : String(body.status).trim().toLowerCase();
+
+    if (status && !validStatuses.has(status)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid status"
+      });
+    }
+
+    const data = {
+      area_wanted: nullableString(body.area_wanted, 500),
+      budget_min: nullableInteger(body.budget_min),
+      budget_max: nullableInteger(body.budget_max),
+      bedrooms: nullableInteger(body.bedrooms),
+      preferred_floor: nullableString(body.preferred_floor, 100),
+      wants_garden: nullableBoolean(body.wants_garden),
+      wants_rooftop: nullableBoolean(body.wants_rooftop),
+      pets_required: nullableBoolean(body.pets_required),
+      pet_details: nullableString(body.pet_details, 500),
+      parking_needed: nullableBoolean(body.parking_needed),
+      move_in_date: nullableDate(body.move_in_date),
+      occupants: nullableString(body.occupants, 500),
+      source_property: nullableString(body.source_property, 800),
+      requirement_summary: nullableString(body.requirement_summary, 3000),
+      status: status || "unknown",
+      analysis_confidence: nullableConfidence(body.analysis_confidence),
+      analysis_notes: nullableString(body.analysis_notes, 3000)
+    };
+
+    if (
+      data.budget_min != null &&
+      data.budget_max != null &&
+      data.budget_min > data.budget_max
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "budget_min cannot exceed budget_max"
+      });
+    }
+
+    if (data.bedrooms != null && (data.bedrooms < 0 || data.bedrooms > 20)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid bedrooms value"
+      });
+    }
+
+    try {
+      const { rows } = await pool.query(`
+        UPDATE renters
+        SET
+          area_wanted = $2,
+          budget_min = $3,
+          budget_max = $4,
+          bedrooms = $5,
+          preferred_floor = $6,
+          wants_garden = $7,
+          wants_rooftop = $8,
+          pets_required = $9,
+          pet_details = $10,
+          parking_needed = $11,
+          move_in_date = $12,
+          occupants = $13,
+          source_property = $14,
+          requirement_summary = $15,
+          status = $16,
+          analysis_confidence = $17,
+          analysis_notes = $18,
+          analysis_source = 'custom_gpt',
+          analysis_updated_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $1
+          AND contact_type = 'renter_prospect'
+        RETURNING
+          id,
+          display_name,
+          phone,
+          area_wanted,
+          budget_min,
+          budget_max,
+          bedrooms,
+          preferred_floor,
+          wants_garden,
+          wants_rooftop,
+          pets_required,
+          pet_details,
+          parking_needed,
+          move_in_date,
+          occupants,
+          source_property,
+          requirement_summary,
+          status,
+          analysis_confidence,
+          analysis_notes,
+          analysis_source,
+          analysis_updated_at
+      `, [
+        id,
+        data.area_wanted,
+        data.budget_min,
+        data.budget_max,
+        data.bedrooms,
+        data.preferred_floor,
+        data.wants_garden,
+        data.wants_rooftop,
+        data.pets_required,
+        data.pet_details,
+        data.parking_needed,
+        data.move_in_date,
+        data.occupants,
+        data.source_property,
+        data.requirement_summary,
+        data.status,
+        data.analysis_confidence,
+        data.analysis_notes
+      ]);
+
+      if (!rows.length) {
+        return res.status(404).json({
+          ok: false,
+          error: "Prospect not found"
+        });
+      }
+
+      res.json({
+        ok: true,
+        prospect: rows[0]
+      });
+    } catch (err) {
+      console.error("GPT prospect analysis save failed:", err);
+      res.status(500).json({
+        ok: false,
+        error: String(err && (err.message || err))
+      });
+    }
+  }
+);
 
 const PROSPECT_LABELS = ["To organise viewing", "Viewings -"];
 
@@ -584,6 +1007,17 @@ app.get("/", (req, res) => {
         <a href="/qr">Open QR pairing</a><br><br>
         <a href="/status">Status JSON</a><br><br>
         <a href="/labels">Preview WhatsApp labels</a>
+      </div>
+
+      <div class="box">
+        <h3>Custom GPT bridge</h3>
+        <p>
+          Status: <b>${gptKey ? "Configured" : "READER_GPT_KEY not set"}</b>
+        </p>
+        <p>
+          The private GPT can read imported prospect conversations and save
+          structured renter requirements. It cannot send WhatsApp messages.
+        </p>
       </div>
 
       <div class="box">
