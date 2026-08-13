@@ -1,0 +1,16 @@
+Zheungyuan Privacy Policy setup
+
+1. Add web/app/privacy/page.js to the GitHub repo.
+2. Commit to main and let the web Railway service redeploy.
+3. Open https://YOUR-ZHEUNGYUAN-WEB-DOMAIN/privacy
+4. Paste that full URL into the Custom GPT Action "Privacy Policy URL" field.
+5. Before wider public use, add a clear public contact method on the Zheungyuan website.
+
+The policy reflects the current architecture:
+- WhatsApp rental enquiry data
+- Railway/Postgres storage
+- private Custom GPT
+- OpenAI processing for AI-assisted structuring
+- renter/property matching
+- no automated final tenancy decisions
+- no sale of personal data
