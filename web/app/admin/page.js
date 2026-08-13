@@ -28,7 +28,12 @@ async function getRenters() {
         contact_type,
         analysis_confidence,
         analysis_notes,
-        analysis_updated_at
+        analysis_updated_at,
+        (
+          SELECT COUNT(*)::int
+          FROM whatsapp_messages wm
+          WHERE wm.renter_id = renters.id
+        ) AS message_count
       FROM renters
       WHERE contact_type = 'renter_prospect'
       ORDER BY last_message_at DESC NULLS LAST, id DESC
@@ -66,6 +71,10 @@ export default async function Admin() {
   const analysed = renters.filter(r => r.analysis_updated_at).length;
   const active = renters.filter(r => r.status === "active").length;
   const historical = renters.filter(r => r.status === "historical").length;
+  const messagesStored = renters.reduce(
+    (sum, r) => sum + Number(r.message_count || 0),
+    0
+  );
 
   return (
     <main className="container admin-wrap">
@@ -82,6 +91,7 @@ export default async function Admin() {
         <div className="card"><span>GPT analysed</span><strong>{analysed}</strong></div>
         <div className="card"><span>Active</span><strong>{active}</strong></div>
         <div className="card"><span>Historical demand</span><strong>{historical}</strong></div>
+        <div className="card"><span>Messages stored</span><strong>{messagesStored.toLocaleString()}</strong></div>
       </div>
 
       <div className="admin-note">
@@ -116,6 +126,9 @@ export default async function Admin() {
                 <td className="lead-main">
                   <div className="lead-name">{r.display_name || r.phone || "Unknown"}</div>
                   {r.phone && <div className="lead-phone">{r.phone}</div>}
+                  <div className="lead-phone">
+                    {Number(r.message_count || 0).toLocaleString()} messages stored
+                  </div>
                   {r.analysis_updated_at && (
                     <span className="confidence">
                       GPT reviewed

@@ -1,16 +1,29 @@
-Zheungyuan Privacy Policy setup
+張園 full-history WhatsApp import + bulk GPT review
 
-1. Add web/app/privacy/page.js to the GitHub repo.
-2. Commit to main and let the web Railway service redeploy.
-3. Open https://YOUR-ZHEUNGYUAN-WEB-DOMAIN/privacy
-4. Paste that full URL into the Custom GPT Action "Privacy Policy URL" field.
-5. Before wider public use, add a clear public contact method on the Zheungyuan website.
+Replace only:
+- reader/server.js
+- web/app/admin/page.js
 
-The policy reflects the current architecture:
-- WhatsApp rental enquiry data
-- Railway/Postgres storage
-- private Custom GPT
-- OpenAI processing for AI-assisted structuring
-- renter/property matching
-- no automated final tenancy decisions
-- no sale of personal data
+Do NOT change:
+- Dockerfile
+- whatsapp-web.js patches
+- Railway volume
+- READER_GPT_KEY
+- your working OpenAPI v1.0.2 Action schema
+
+After deploy:
+1. Open the whatsapp-reader homepage.
+2. Click "Import ALL prospect leads + full message history".
+3. The import runs in the background. Watch its JSON status.
+4. Wait until running=false and completedAt has a value.
+5. Open /admin. It now shows total messages stored and message count per lead.
+6. Add CUSTOM_GPT_BULK_INSTRUCTIONS_v1.0.3.md to the existing Custom GPT instructions.
+7. Ask the GPT:
+   "Analyse every unreviewed renter lead and save the results. Continue until there are zero unreviewed prospects."
+
+The full import:
+- scans every direct WhatsApp chat available to the connected WhatsApp Web session;
+- matches "To organise viewing" or "Viewings -";
+- excludes chats also labelled "Tenants";
+- loads the complete available history using fetchMessages({limit: Infinity});
+- is safe to rerun because existing WhatsApp message IDs are not duplicated.

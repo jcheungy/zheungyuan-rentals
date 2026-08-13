@@ -22,6 +22,19 @@ let syncState = {
   messagesSaved: 0
 };
 
+let bulkImportState = {
+  running: false,
+  startedAt: null,
+  completedAt: null,
+  chatsScanned: 0,
+  matchingProspectsFound: 0,
+  prospectsProcessed: 0,
+  messagesRead: 0,
+  newMessagesSaved: 0,
+  currentProspect: null,
+  error: null
+};
+
 const authPath = process.env.WA_AUTH_PATH || "./.wwebjs_auth";
 const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
 const gptKey = process.env.READER_GPT_KEY || "";
@@ -718,7 +731,11 @@ async function findProspectChats({
   let chatsScanned = 0;
   let skippedExistingTenants = 0;
 
-  for (const chat of directChats.slice(0, scanLimit)) {
+  const chatsToScan = Number.isFinite(scanLimit)
+    ? directChats.slice(0, scanLimit)
+    : directChats;
+
+  for (const chat of chatsToScan) {
     chatsScanned++;
 
     let chatLabels = [];
@@ -758,7 +775,7 @@ async function findProspectChats({
       labels: labelNames
     });
 
-    if (selected.length >= limitChats) break;
+    if (Number.isFinite(limitChats) && selected.length >= limitChats) break;
 
     await new Promise(resolve => setTimeout(resolve, 60));
   }
@@ -940,6 +957,122 @@ app.post("/sync/prospects", async (req, res) => {
   }
 });
 
+
+async function runFullProspectImport() {
+  bulkImportState = {
+    running: true,
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    chatsScanned: 0,
+    matchingProspectsFound: 0,
+    prospectsProcessed: 0,
+    messagesRead: 0,
+    newMessagesSaved: 0,
+    currentProspect: null,
+    error: null
+  };
+
+  try {
+    const result = await findProspectChats({
+      limitChats: Infinity,
+      scanLimit: Infinity
+    });
+
+    bulkImportState.chatsScanned = result.chatsScanned;
+    bulkImportState.matchingProspectsFound = result.selected.length;
+
+    for (const { chat, labels } of result.selected) {
+      const chatId = chat && chat.id && chat.id._serialized
+        ? chat.id._serialized
+        : "";
+
+      bulkImportState.currentProspect =
+        chat.name || phoneFromChatId(chatId) || chatId || "Unknown";
+
+      try {
+        const renterId = await upsertRenter(
+          chat,
+          labels,
+          "renter_prospect"
+        );
+
+        const messages = await withDetachedFrameRetry(
+          () => chat.fetchMessages({ limit: Infinity }),
+          2
+        );
+
+        bulkImportState.messagesRead += messages.length;
+
+        for (const message of messages) {
+          bulkImportState.newMessagesSaved += await saveMessage(
+            chatId,
+            renterId,
+            message
+          );
+        }
+
+        await updateRenterDates(renterId);
+        bulkImportState.prospectsProcessed++;
+      } catch (err) {
+        console.warn(
+          `Could not fully import prospect ${chatId}:`,
+          String(err && (err.stack || err.message || err))
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+
+    bulkImportState.running = false;
+    bulkImportState.currentProspect = null;
+    bulkImportState.completedAt = new Date().toISOString();
+
+    console.log(
+      `Full prospect import complete: ${bulkImportState.prospectsProcessed} prospects, ` +
+      `${bulkImportState.messagesRead} messages read, ` +
+      `${bulkImportState.newMessagesSaved} new messages saved`
+    );
+  } catch (err) {
+    bulkImportState.running = false;
+    bulkImportState.currentProspect = null;
+    bulkImportState.completedAt = new Date().toISOString();
+    bulkImportState.error = String(err && (err.stack || err.message || err));
+    console.error("Full prospect import failed:", bulkImportState.error);
+  }
+}
+
+app.post("/sync/prospects/all", async (req, res) => {
+  if (!waReady) {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
+  }
+
+  if (syncState.running || bulkImportState.running) {
+    return res.status(409).json({
+      ok: false,
+      error: "A WhatsApp import is already running"
+    });
+  }
+
+  runFullProspectImport();
+
+  return res.status(202).json({
+    ok: true,
+    started: true,
+    message:
+      "Full historical prospect import started. All matching labelled chats and all available messages will be imported."
+  });
+});
+
+app.get("/sync/prospects/all/status", (req, res) => {
+  res.json({
+    ok: true,
+    ...bulkImportState
+  });
+});
+
 app.get("/", (req, res) => {
   res.type("html").send(`
   <html>
@@ -1042,11 +1175,28 @@ app.get("/", (req, res) => {
             Preview prospects
           </button>
           <button id="syncBtn" onclick="syncProspects()" ${waReady ? "" : "disabled"} style="margin-left:8px">
-            Import prospects
+            Import selected sample
           </button>
         </div>
 
         <pre id="result">Preview the prospects before importing them.</pre>
+
+        <div style="margin-top:24px;padding-top:22px;border-top:1px solid #d8d1c4">
+          <h3>Full historical import</h3>
+          <p>
+            Imports <b>every direct chat</b> carrying either prospect label,
+            still excludes <b>Tenants</b>, and loads the <b>complete available
+            WhatsApp message history</b> for each matched prospect.
+          </p>
+          <button
+            id="bulkSyncBtn"
+            onclick="startFullProspectImport()"
+            ${waReady ? "" : "disabled"}
+          >
+            Import ALL prospect leads + full message history
+          </button>
+          <pre id="bulkResult">Full import has not been started.</pre>
+        </div>
       </div>
 
       <script>
@@ -1111,6 +1261,70 @@ app.get("/", (req, res) => {
             btn.disabled = false;
           }
         }
+
+
+        let fullImportTimer = null;
+
+        async function refreshFullImportStatus() {
+          const result = document.getElementById("bulkResult");
+          const btn = document.getElementById("bulkSyncBtn");
+
+          try {
+            const response = await fetch("/sync/prospects/all/status");
+            const data = await response.json();
+            result.textContent = JSON.stringify(data, null, 2);
+
+            if (data.running) {
+              btn.disabled = true;
+              if (!fullImportTimer) {
+                fullImportTimer = setInterval(refreshFullImportStatus, 3000);
+              }
+            } else {
+              btn.disabled = false;
+              if (fullImportTimer) {
+                clearInterval(fullImportTimer);
+                fullImportTimer = null;
+              }
+            }
+          } catch (err) {
+            result.textContent = "Status error: " + err.message;
+          }
+        }
+
+        async function startFullProspectImport() {
+          const btn = document.getElementById("bulkSyncBtn");
+          const result = document.getElementById("bulkResult");
+
+          const ok = window.confirm(
+            "Import every matching prospect chat and its complete available WhatsApp message history? This can take several minutes."
+          );
+          if (!ok) return;
+
+          btn.disabled = true;
+          result.textContent = "Starting full historical import…";
+
+          try {
+            const response = await fetch("/sync/prospects/all", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" }
+            });
+            const data = await response.json();
+
+            if (!response.ok) {
+              result.textContent = JSON.stringify(data, null, 2);
+              btn.disabled = false;
+              return;
+            }
+
+            result.textContent = JSON.stringify(data, null, 2);
+            await refreshFullImportStatus();
+          } catch (err) {
+            result.textContent = "Error: " + err.message;
+            btn.disabled = false;
+          }
+        }
+
+        refreshFullImportStatus();
       </script>
     </body>
   </html>`);
@@ -1138,7 +1352,7 @@ app.get("/qr", (req, res) => {
 });
 
 app.get("/status", (req, res) => {
-  res.json({ ok: true, waReady, ...syncState });
+  res.json({ ok: true, waReady, sync: syncState, fullProspectImport: bulkImportState });
 });
 
 app.get("/labels", async (req, res) => {
