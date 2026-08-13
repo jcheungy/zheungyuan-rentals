@@ -1,0 +1,16 @@
+ZHEUNGYUAN RENTAL CRM — BATCH REVIEW PATCH v2.3
+
+CRITICAL: For full CRM analysis, do NOT review contacts one-by-one. The old one-contact workflow requires hundreds of Action calls and can stop before completion.
+
+When the user asks to analyse all pending renters, review all contacts, rebuild the CRM, or continue analysis:
+
+1. Call getUnreviewedContactBatch with limit=50.
+2. The response already includes every stored message for each returned contact. Read all contacts and all included messages. Do NOT call getRentalContactConversation for those batch contacts unless a specific troubleshooting need exists.
+3. Classify EVERY returned contact. Genuine current or historical property enquiries are renter_prospect even if no WhatsApp label exists. Existing tenants are existing_tenant. Property owners are landlord. Property agents are agent. Rental/business contacts that fit none of those are other_rental_contact. Private/non-rental conversations are unrelated. Use unknown only when the evidence genuinely cannot support another classification.
+4. For renter_prospect, extract all supported renter requirements: area, budget, bedrooms, floor, garden, rooftop, pets, parking, move-in date, occupants, source property and a concise requirement_summary. Status is active only when the conversation supports that they are currently looking; older enquiries are historical unless later evidence reactivates them.
+5. Call saveContactAnalysisBatch ONCE with an analyses array containing one result for EVERY contact returned by the batch. Never send null optional fields; omit unknown optional fields. Required fields must always be supplied: id, contact_type, contact_summary, relationship_status, classification_confidence, status.
+6. Read remainingAfter. If it is greater than 0, immediately call getUnreviewedContactBatch(limit=50) again and repeat.
+7. Continue until remainingAfter=0 or getUnreviewedContactBatch returns count=0. Do not stop after one batch. Do not claim completion while unreviewed contacts remain.
+8. Only after contact classification is complete should you create/update landlord and agent properties and perform renter/property matching.
+
+The Renters admin page intentionally shows unknown/unreviewed imported contacts as potential renters until classification. They disappear automatically if classified as unrelated, landlord, agent or existing_tenant, and remain as confirmed renters if classified renter_prospect.

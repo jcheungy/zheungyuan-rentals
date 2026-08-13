@@ -600,7 +600,7 @@ app.get("/gpt/health", requireGptAuth, async (req, res) => {
       ok: true,
       service: "zheungyuan-rental-crm",
       gptBridge: true,
-      crmVersion: "2.0"
+      crmVersion: "2.3-batch-review"
     });
   } catch (err) {
     res.status(500).json({
@@ -619,6 +619,7 @@ app.get("/gpt/overview", requireGptAuth, async (req, res) => {
         COUNT(*) FILTER (WHERE contact_type='existing_tenant')::int tenants,
         COUNT(*) FILTER (WHERE contact_type='landlord')::int landlords,
         COUNT(*) FILTER (WHERE contact_type='agent')::int agents,
+        COUNT(*) FILTER (WHERE classification_updated_at IS NULL)::int unreviewed,
         COUNT(*) FILTER (WHERE classification_updated_at IS NOT NULL)::int reviewed
       FROM renters
       WHERE contact_type <> 'unrelated'
@@ -936,6 +937,291 @@ app.post(
     }
   }
 );
+
+
+/* ---------------- GPT BATCH REVIEW API ----------------
+ *
+ * The original per-contact workflow required 2+ Action calls per contact.
+ * With ~400 imported contacts that can exceed a Custom GPT turn/tool budget
+ * long before the CRM is fully classified. These endpoints intentionally
+ * return many unreviewed contacts WITH their stored messages in one call and
+ * save many analyses in one call.
+ */
+
+app.get("/gpt/review-batch", requireGptAuth, async (req, res) => {
+  const limit = Math.max(
+    1,
+    Math.min(Number(req.query.limit || 50), 50)
+  );
+
+  try {
+    const remainingResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM renters
+      WHERE classification_updated_at IS NULL
+    `);
+
+    const contactsResult = await pool.query(`
+      SELECT
+        r.id,
+        r.display_name,
+        r.phone,
+        r.contact_type,
+        r.status,
+        r.labels,
+        r.first_enquiry_at,
+        r.last_message_at,
+        r.contact_summary,
+        r.relationship_status,
+        r.requirement_summary,
+        r.area_wanted,
+        r.budget_min,
+        r.budget_max,
+        r.bedrooms,
+        r.preferred_floor,
+        r.wants_garden,
+        r.wants_rooftop,
+        r.pets_required,
+        r.pet_details,
+        r.parking_needed,
+        r.move_in_date,
+        r.occupants,
+        r.source_property,
+        r.classification_confidence,
+        r.analysis_confidence,
+        r.analysis_notes,
+        (
+          SELECT COUNT(*)::int
+          FROM whatsapp_messages wm
+          WHERE wm.renter_id=r.id
+        ) AS message_count
+      FROM renters r
+      WHERE r.classification_updated_at IS NULL
+      ORDER BY
+        r.last_message_at DESC NULLS LAST,
+        r.id DESC
+      LIMIT $1
+    `, [limit]);
+
+    const contacts = [];
+
+    for (const contact of contactsResult.rows) {
+      const messagesResult = await pool.query(`
+        SELECT direction, body, message_type, message_at, id
+        FROM whatsapp_messages
+        WHERE renter_id=$1
+        ORDER BY message_at ASC NULLS FIRST, id ASC
+      `, [contact.id]);
+
+      contacts.push({
+        ...contact,
+        messages: messagesResult.rows
+      });
+    }
+
+    res.json({
+      ok: true,
+      count: contacts.length,
+      remainingBefore: remainingResult.rows[0].count,
+      contacts
+    });
+  } catch (err) {
+    console.error("GPT review batch failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.post("/gpt/review-batch", requireGptAuth, async (req, res) => {
+  const body = req.body || {};
+  const analyses = Array.isArray(body.analyses)
+    ? body.analyses
+    : [];
+
+  if (!analyses.length || analyses.length > 50) {
+    return res.status(400).json({
+      ok: false,
+      error: "analyses must contain between 1 and 50 items"
+    });
+  }
+
+  const seen = new Set();
+  const prepared = [];
+
+  for (let i = 0; i < analyses.length; i++) {
+    const item = analyses[i] || {};
+    const id = Number(item.id);
+
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({
+        ok: false,
+        error: `Invalid contact id at analyses[${i}]`
+      });
+    }
+
+    if (seen.has(id)) {
+      return res.status(400).json({
+        ok: false,
+        error: `Duplicate contact id ${id}`
+      });
+    }
+    seen.add(id);
+
+    const contactType = validContactType(item.contact_type);
+    if (!contactType) {
+      return res.status(400).json({
+        ok: false,
+        error: `Invalid contact_type for contact ${id}`
+      });
+    }
+
+    const renterStatus = validRenterStatus(item.status || "unknown");
+    if (!renterStatus) {
+      return res.status(400).json({
+        ok: false,
+        error: `Invalid status for contact ${id}`
+      });
+    }
+
+    const data = {
+      id,
+      contact_type: contactType,
+      contact_summary: nullableString(item.contact_summary, 4000),
+      relationship_status: nullableString(item.relationship_status, 200),
+      classification_confidence: nullableConfidence(item.classification_confidence),
+      area_wanted: nullableString(item.area_wanted, 500),
+      budget_min: nullableInteger(item.budget_min),
+      budget_max: nullableInteger(item.budget_max),
+      bedrooms: nullableInteger(item.bedrooms),
+      preferred_floor: nullableString(item.preferred_floor, 100),
+      wants_garden: nullableBoolean(item.wants_garden),
+      wants_rooftop: nullableBoolean(item.wants_rooftop),
+      pets_required: nullableBoolean(item.pets_required),
+      pet_details: nullableString(item.pet_details, 500),
+      parking_needed: nullableBoolean(item.parking_needed),
+      move_in_date: nullableDate(item.move_in_date),
+      occupants: nullableString(item.occupants, 500),
+      source_property: nullableString(item.source_property, 800),
+      requirement_summary: nullableString(item.requirement_summary, 3000),
+      status: renterStatus,
+      analysis_confidence: nullableConfidence(item.analysis_confidence),
+      analysis_notes: nullableString(item.analysis_notes, 3000)
+    };
+
+    if (
+      data.budget_min != null &&
+      data.budget_max != null &&
+      data.budget_min > data.budget_max
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: `budget_min cannot exceed budget_max for contact ${id}`
+      });
+    }
+
+    prepared.push(data);
+  }
+
+  const db = await pool.connect();
+
+  try {
+    await db.query("BEGIN");
+
+    const saved = [];
+
+    for (const data of prepared) {
+      const { rows } = await db.query(`
+        UPDATE renters SET
+          contact_type=$2,
+          contact_summary=COALESCE($3, contact_summary),
+          relationship_status=COALESCE($4, relationship_status),
+          classification_confidence=COALESCE($5, classification_confidence),
+          classification_updated_at=NOW(),
+
+          area_wanted=COALESCE($6, area_wanted),
+          budget_min=COALESCE($7, budget_min),
+          budget_max=COALESCE($8, budget_max),
+          bedrooms=COALESCE($9, bedrooms),
+          preferred_floor=COALESCE($10, preferred_floor),
+          wants_garden=COALESCE($11, wants_garden),
+          wants_rooftop=COALESCE($12, wants_rooftop),
+          pets_required=COALESCE($13, pets_required),
+          pet_details=COALESCE($14, pet_details),
+          parking_needed=COALESCE($15, parking_needed),
+          move_in_date=COALESCE($16, move_in_date),
+          occupants=COALESCE($17, occupants),
+          source_property=COALESCE($18, source_property),
+          requirement_summary=COALESCE($19, requirement_summary),
+          status=$20,
+          analysis_confidence=COALESCE($21, analysis_confidence),
+          analysis_notes=COALESCE($22, analysis_notes),
+          analysis_source='custom_gpt_batch',
+          analysis_updated_at=NOW(),
+          updated_at=NOW()
+        WHERE id=$1
+          AND classification_updated_at IS NULL
+        RETURNING id, contact_type, status
+      `, [
+        data.id,
+        data.contact_type,
+        data.contact_summary,
+        data.relationship_status,
+        data.classification_confidence,
+        data.area_wanted,
+        data.budget_min,
+        data.budget_max,
+        data.bedrooms,
+        data.preferred_floor,
+        data.wants_garden,
+        data.wants_rooftop,
+        data.pets_required,
+        data.pet_details,
+        data.parking_needed,
+        data.move_in_date,
+        data.occupants,
+        data.source_property,
+        data.requirement_summary,
+        data.status,
+        data.analysis_confidence,
+        data.analysis_notes
+      ]);
+
+      if (!rows.length) {
+        throw new Error(
+          `Contact ${data.id} was not found or has already been reviewed`
+        );
+      }
+
+      saved.push(rows[0]);
+    }
+
+    const remainingResult = await db.query(`
+      SELECT COUNT(*)::int AS count
+      FROM renters
+      WHERE classification_updated_at IS NULL
+    `);
+
+    await db.query("COMMIT");
+
+    res.json({
+      ok: true,
+      savedCount: saved.length,
+      saved,
+      remainingAfter: remainingResult.rows[0].count
+    });
+  } catch (err) {
+    await db.query("ROLLBACK");
+    console.error("GPT batch analysis save failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  } finally {
+    db.release();
+  }
+});
 
 /* Backwards-compatible prospect endpoints */
 
