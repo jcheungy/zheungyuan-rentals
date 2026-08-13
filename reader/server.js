@@ -52,6 +52,25 @@ let discoveryImportState = {
   error: null
 };
 
+let historySyncState = {
+  running: false,
+  phase: null,
+  startedAt: null,
+  completedAt: null,
+  directChatsFound: 0,
+  chatsProcessed: 0,
+  historyRequestsAttempted: 0,
+  historyRequestsSucceeded: 0,
+  historyRequestsUnavailable: 0,
+  historyRequestErrors: 0,
+  messagesRead: 0,
+  newMessagesSaved: 0,
+  secondPassMessagesRead: 0,
+  secondPassNewMessagesSaved: 0,
+  currentContact: null,
+  error: null
+};
+
 const authPath = process.env.WA_AUTH_PATH || "./.wwebjs_auth";
 const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
 const gptKey = process.env.READER_GPT_KEY || "";
@@ -1621,6 +1640,248 @@ app.get("/sync/discovery/all/status", (req, res) => {
 });
 
 
+
+/*
+ * Request WhatsApp peer history for every direct chat, then import every
+ * message WhatsApp Web makes available. A second full fetch pass is performed
+ * after all history requests have had time to settle.
+ */
+async function runFullHistorySync() {
+  historySyncState = {
+    running: true,
+    phase: "request_and_import",
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    directChatsFound: 0,
+    chatsProcessed: 0,
+    historyRequestsAttempted: 0,
+    historyRequestsSucceeded: 0,
+    historyRequestsUnavailable: 0,
+    historyRequestErrors: 0,
+    messagesRead: 0,
+    newMessagesSaved: 0,
+    secondPassMessagesRead: 0,
+    secondPassNewMessagesSaved: 0,
+    currentContact: null,
+    error: null
+  };
+
+  try {
+    const allChats = await withDetachedFrameRetry(
+      () => client.getChats()
+    );
+
+    const directChats = allChats
+      .filter(chat => !chat.isGroup)
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    historySyncState.directChatsFound = directChats.length;
+
+    for (const chat of directChats) {
+      const chatId =
+        chat && chat.id && chat.id._serialized
+          ? chat.id._serialized
+          : "";
+
+      historySyncState.currentContact =
+        chat.name || phoneFromChatId(chatId) || chatId || "Unknown";
+
+      try {
+        let labelNames = [];
+
+        try {
+          const chatLabels = await withDetachedFrameRetry(
+            () => client.getChatLabels(chatId),
+            2
+          );
+
+          labelNames = chatLabels
+            .map(label => label.name)
+            .filter(Boolean);
+        } catch (err) {
+          console.warn(
+            `Could not read labels while syncing history for ${chatId}:`,
+            String(err && (err.message || err))
+          );
+        }
+
+        const contactId = await upsertContact(
+          chat,
+          labelNames,
+          inferTypeFromLabels(labelNames)
+        );
+
+        historySyncState.historyRequestsAttempted++;
+
+        let historyRequested = false;
+
+        try {
+          historyRequested = await withDetachedFrameRetry(
+            () => client.syncHistory(chatId),
+            2
+          );
+
+          if (historyRequested) {
+            historySyncState.historyRequestsSucceeded++;
+          } else {
+            historySyncState.historyRequestsUnavailable++;
+          }
+        } catch (err) {
+          historySyncState.historyRequestErrors++;
+          console.warn(
+            `History request failed for ${chatId}:`,
+            String(err && (err.stack || err.message || err))
+          );
+        }
+
+        // Give successful peer-history requests a short opportunity to begin
+        // delivering messages before the first fetch. The second pass below
+        // catches slower transfers.
+        await new Promise(resolve =>
+          setTimeout(resolve, historyRequested ? 1500 : 150)
+        );
+
+        const messages = await withDetachedFrameRetry(
+          () => chat.fetchMessages({ limit: Infinity }),
+          2
+        );
+
+        historySyncState.messagesRead += messages.length;
+
+        for (const message of messages) {
+          historySyncState.newMessagesSaved += await saveMessage(
+            chatId,
+            contactId,
+            message
+          );
+        }
+
+        await updateContactDates(contactId);
+      } catch (err) {
+        console.warn(
+          `Could not history-sync/import chat ${chatId}:`,
+          String(err && (err.stack || err.message || err))
+        );
+      }
+
+      historySyncState.chatsProcessed++;
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+
+    // Some peer-history transfers arrive well after syncHistory() resolves.
+    // Wait briefly, then refetch every direct chat once more.
+    historySyncState.phase = "second_fetch";
+    historySyncState.currentContact = "Waiting for history transfers";
+    await new Promise(resolve => setTimeout(resolve, 15000));
+
+    for (const chat of directChats) {
+      const chatId =
+        chat && chat.id && chat.id._serialized
+          ? chat.id._serialized
+          : "";
+
+      historySyncState.currentContact =
+        chat.name || phoneFromChatId(chatId) || chatId || "Unknown";
+
+      try {
+        const { rows } = await pool.query(
+          `SELECT id FROM renters WHERE whatsapp_chat_id=$1`,
+          [chatId]
+        );
+
+        if (!rows.length) continue;
+        const contactId = rows[0].id;
+
+        const messages = await withDetachedFrameRetry(
+          () => chat.fetchMessages({ limit: Infinity }),
+          2
+        );
+
+        historySyncState.secondPassMessagesRead += messages.length;
+
+        for (const message of messages) {
+          historySyncState.secondPassNewMessagesSaved += await saveMessage(
+            chatId,
+            contactId,
+            message
+          );
+        }
+
+        await updateContactDates(contactId);
+      } catch (err) {
+        console.warn(
+          `Second history fetch failed for ${chatId}:`,
+          String(err && (err.stack || err.message || err))
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    historySyncState.running = false;
+    historySyncState.phase = "complete";
+    historySyncState.currentContact = null;
+    historySyncState.completedAt = new Date().toISOString();
+
+    console.log(
+      `Full history sync complete: ${historySyncState.chatsProcessed}/${historySyncState.directChatsFound} chats; ` +
+      `${historySyncState.historyRequestsSucceeded} history requests accepted; ` +
+      `${historySyncState.newMessagesSaved + historySyncState.secondPassNewMessagesSaved} new messages saved`
+    );
+  } catch (err) {
+    historySyncState.running = false;
+    historySyncState.phase = "failed";
+    historySyncState.currentContact = null;
+    historySyncState.completedAt = new Date().toISOString();
+    historySyncState.error = String(
+      err && (err.stack || err.message || err)
+    );
+
+    console.error("Full history sync failed:", historySyncState.error);
+  }
+}
+
+app.post("/sync/history/all", async (req, res) => {
+  if (!waReady) {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
+  }
+
+  if (
+    syncState.running ||
+    bulkImportState.running ||
+    discoveryImportState.running ||
+    historySyncState.running
+  ) {
+    return res.status(409).json({
+      ok: false,
+      error: "A WhatsApp import or history sync is already running"
+    });
+  }
+
+  runFullHistorySync();
+
+  return res.status(202).json({
+    ok: true,
+    started: true,
+    message:
+      "Full WhatsApp peer-history sync started for every direct chat. History will be requested, imported, then fetched again in a second pass."
+  });
+});
+
+app.get("/sync/history/all/status", (req, res) => {
+  res.json({
+    ok: true,
+    ...historySyncState,
+    totalNewMessagesSaved:
+      historySyncState.newMessagesSaved +
+      historySyncState.secondPassNewMessagesSaved
+  });
+});
+
+
 /* ---------------- WhatsApp import ---------------- */
 
 async function findChatsByLabels({
@@ -1834,7 +2095,7 @@ app.post("/sync/crm/all", async (req, res) => {
     });
   }
 
-  if (syncState.running || bulkImportState.running || discoveryImportState.running) {
+  if (syncState.running || bulkImportState.running || discoveryImportState.running || historySyncState.running) {
     return res.status(409).json({
       ok: false,
       error: "A WhatsApp import is already running"
@@ -1932,7 +2193,7 @@ app.post("/sync/prospects", async (req, res) => {
     });
   }
 
-  if (syncState.running || bulkImportState.running || discoveryImportState.running) {
+  if (syncState.running || bulkImportState.running || discoveryImportState.running || historySyncState.running) {
     return res.status(409).json({
       ok: false,
       error: "Sync already running"
@@ -2090,7 +2351,7 @@ app.post("/sync/prospects/all", async (req, res) => {
     });
   }
 
-  if (syncState.running || bulkImportState.running || discoveryImportState.running) {
+  if (syncState.running || bulkImportState.running || discoveryImportState.running || historySyncState.running) {
     return res.status(409).json({
       ok: false,
       error: "A WhatsApp import is already running"
@@ -2190,6 +2451,34 @@ app.get("/", (req, res) => {
         <a href="/status">Status JSON</a> ·
         <a href="/labels">WhatsApp labels</a> ·
         <a href="/crm/preview">Preview rental CRM chats</a>
+      </div>
+
+      <div class="box">
+        <h3>Sync ALL WhatsApp history</h3>
+        <p>
+          Requests peer-history transfer for every direct chat and then imports
+          every message WhatsApp Web makes available. A second import pass runs
+          automatically after the history requests.
+        </p>
+
+        <div class="warn">
+          This uses the unofficial WhatsApp Web client for all 399 direct chats.
+          WhatsApp may not make older history available for every chat; the
+          status below reports how many history requests were accepted and how
+          many genuinely new messages were recovered.
+        </div>
+
+        <div style="margin-top:18px">
+          <button
+            id="historyBtn"
+            onclick="startHistorySync()"
+            ${waReady ? "" : "disabled"}
+          >
+            Sync ALL chat history + import ALL messages
+          </button>
+        </div>
+
+        <pre id="historyResult">Full history sync has not been started.</pre>
       </div>
 
       <div class="box">
@@ -2299,6 +2588,61 @@ app.get("/", (req, res) => {
         }
 
 
+
+        let historyTimer = null;
+
+        async function refreshHistoryStatus() {
+          const result = document.getElementById("historyResult");
+          const btn = document.getElementById("historyBtn");
+
+          try {
+            const response = await fetch("/sync/history/all/status");
+            const data = await response.json();
+            result.textContent = JSON.stringify(data, null, 2);
+
+            if (data.running) {
+              btn.disabled = true;
+              if (!historyTimer) {
+                historyTimer = setInterval(
+                  refreshHistoryStatus,
+                  3000
+                );
+              }
+            } else {
+              btn.disabled = false;
+              if (historyTimer) {
+                clearInterval(historyTimer);
+                historyTimer = null;
+              }
+            }
+          } catch (err) {
+            result.textContent =
+              "History sync status error: " + err.message;
+          }
+        }
+
+        async function startHistorySync() {
+          const ok = window.confirm(
+            "Request WhatsApp history sync for EVERY direct chat, then import every available message? This may take several minutes."
+          );
+          if (!ok) return;
+
+          document.getElementById("historyBtn").disabled = true;
+
+          const response = await fetch("/sync/history/all", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"}
+          });
+
+          const data = await response.json();
+          document.getElementById("historyResult").textContent =
+            JSON.stringify(data, null, 2);
+
+          await refreshHistoryStatus();
+        }
+
+        refreshHistoryStatus();
+
         let discoveryTimer = null;
 
         async function refreshDiscoveryStatus() {
@@ -2386,6 +2730,7 @@ app.get("/status", (req, res) => {
     sync: syncState,
     bulkImport: bulkImportState,
     discoveryImport: discoveryImportState,
+    historySync: historySyncState,
     crmImportLabels: CRM_IMPORT_LABELS
   });
 });
