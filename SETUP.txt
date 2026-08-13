@@ -1,29 +1,72 @@
-張園 full-history WhatsApp import + bulk GPT review
+張園 Full Rental CRM v2
 
-Replace only:
+WHAT THIS DOES
+- Keeps the working WhatsApp/Chromium setup.
+- Preserves the existing 8 renter records and message history.
+- Expands the same database to classify rental contacts as renter, tenant,
+  landlord, agent, other rental contact, unrelated or unknown.
+- Imports ALL available messages for recognised rental-labelled chats.
+- Adds landlord/agent property extraction.
+- Adds saved property-to-renter matches.
+- Adds admin sections: Overview, Renters, Landlords, Properties, Agents, Matches.
+- Adds paginated GPT conversation reading so the GPT can genuinely read every
+  stored message, even when a contact has more than 500 messages.
+
+FILES TO REPLACE / ADD
+Replace:
 - reader/server.js
 - web/app/admin/page.js
 
-Do NOT change:
+Add:
+- web/app/admin/layout.js
+- web/app/admin/renters/page.js
+- web/app/admin/landlords/page.js
+- web/app/admin/properties/page.js
+- web/app/admin/agents/page.js
+- web/app/admin/matches/page.js
+
+CUSTOM GPT
+Replace the old Action schema with:
+- Zheungyuan_Custom_GPT_Action_OpenAPI_v2.yaml
+
+Replace the GPT instructions with:
+- Zheungyuan_Custom_GPT_Instructions_v2.txt
+
+Keep the existing Action authentication:
+API Key -> Bearer -> same READER_GPT_KEY.
+
+IMPORT
+After Railway deploy:
+1. Open the whatsapp-reader homepage.
+2. Click "Preview rental CRM chats".
+3. Click "Import ALL rental CRM chats + ALL messages".
+4. Wait until running=false.
+
+DEFAULT RENTAL LABELS
+- To organise viewing
+- Viewings -
+- Tenants
+- Agents
+- Landlords / Landlord / Owners / Property owners
+
+Private/unlabelled chats are NOT imported.
+
+If your landlord chats use another WhatsApp label, add the Railway variable:
+CRM_EXTRA_LABELS=Your label,Another label
+
+If a landlord chat is currently unlabelled, give it a "Landlords" label in
+WhatsApp and rerun the import. This avoids importing unrelated private chats.
+
+THEN ASK THE GPT
+"Build the full rental CRM. Review every imported rental contact and every
+stored message, classify each contact, save renter demand, create or update
+properties from landlord/agent conversations, then match available properties
+against active renters and relevant historical demand. Continue until complete."
+
+IMPORTANT
+Do NOT delete:
+- Railway volume
+- .wwebjs_auth
+- READER_GPT_KEY
 - Dockerfile
 - whatsapp-web.js patches
-- Railway volume
-- READER_GPT_KEY
-- your working OpenAPI v1.0.2 Action schema
-
-After deploy:
-1. Open the whatsapp-reader homepage.
-2. Click "Import ALL prospect leads + full message history".
-3. The import runs in the background. Watch its JSON status.
-4. Wait until running=false and completedAt has a value.
-5. Open /admin. It now shows total messages stored and message count per lead.
-6. Add CUSTOM_GPT_BULK_INSTRUCTIONS_v1.0.3.md to the existing Custom GPT instructions.
-7. Ask the GPT:
-   "Analyse every unreviewed renter lead and save the results. Continue until there are zero unreviewed prospects."
-
-The full import:
-- scans every direct WhatsApp chat available to the connected WhatsApp Web session;
-- matches "To organise viewing" or "Viewings -";
-- excludes chats also labelled "Tenants";
-- loads the complete available history using fetchMessages({limit: Infinity});
-- is safe to rerun because existing WhatsApp message IDs are not duplicated.

@@ -6,15 +6,18 @@ const path = require("path");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 
 const app = express();
-app.use(express.json({ limit: "3mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false } : undefined
+  ssl: process.env.NODE_ENV === "production"
+    ? { rejectUnauthorized: false }
+    : undefined
 });
 
 let qrDataUrl = null;
 let waReady = false;
+
 let syncState = {
   running: false,
   lastSync: null,
@@ -24,14 +27,15 @@ let syncState = {
 
 let bulkImportState = {
   running: false,
+  mode: null,
   startedAt: null,
   completedAt: null,
   chatsScanned: 0,
-  matchingProspectsFound: 0,
-  prospectsProcessed: 0,
+  matchingChatsFound: 0,
+  contactsProcessed: 0,
   messagesRead: 0,
   newMessagesSaved: 0,
-  currentProspect: null,
+  currentContact: null,
   error: null
 };
 
@@ -39,9 +43,39 @@ const authPath = process.env.WA_AUTH_PATH || "./.wwebjs_auth";
 const clientId = process.env.WA_CLIENT_ID || "zheungyuan-rentals";
 const gptKey = process.env.READER_GPT_KEY || "";
 
+const PROSPECT_LABELS = ["To organise viewing", "Viewings -"];
+const TENANT_LABELS = ["Tenants"];
+const AGENT_LABELS = ["Agents"];
+const LANDLORD_LABELS = ["Landlords", "Landlord", "Owners", "Property owners"];
+
+const DEFAULT_CRM_LABELS = [
+  ...PROSPECT_LABELS,
+  ...TENANT_LABELS,
+  ...AGENT_LABELS,
+  ...LANDLORD_LABELS
+];
+
+const EXTRA_CRM_LABELS = String(process.env.CRM_EXTRA_LABELS || "")
+  .split(",")
+  .map(x => x.trim())
+  .filter(Boolean);
+
+const CRM_IMPORT_LABELS = [...new Set([
+  ...DEFAULT_CRM_LABELS,
+  ...EXTRA_CRM_LABELS
+])];
+
 function clearStaleChromiumLocks() {
-  const lockNames = new Set(["SingletonLock", "SingletonSocket", "SingletonCookie"]);
-  const roots = [authPath, path.join(authPath, `session-${clientId}`)];
+  const lockNames = new Set([
+    "SingletonLock",
+    "SingletonSocket",
+    "SingletonCookie"
+  ]);
+
+  const roots = [
+    authPath,
+    path.join(authPath, `session-${clientId}`)
+  ];
 
   function walk(dir, depth = 0) {
     if (depth > 3) return;
@@ -65,7 +99,10 @@ function clearStaleChromiumLocks() {
           console.log(`Removed stale Chromium lock: ${target}`);
         } catch (err) {
           if (err.code !== "ENOENT") {
-            console.warn(`Could not remove stale Chromium lock ${target}:`, err.message);
+            console.warn(
+              `Could not remove stale Chromium lock ${target}:`,
+              err.message
+            );
           }
         }
         continue;
@@ -86,9 +123,14 @@ const client = new Client({
     dataPath: authPath
   }),
   puppeteer: {
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    executablePath:
+      process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage"
+    ]
   }
 });
 
@@ -98,7 +140,9 @@ client.on("qr", async qr => {
   console.log("WhatsApp QR generated");
 });
 
-client.on("authenticated", () => console.log("WhatsApp authenticated"));
+client.on("authenticated", () =>
+  console.log("WhatsApp authenticated")
+);
 
 client.on("ready", () => {
   waReady = true;
@@ -120,6 +164,7 @@ async function ensureSchema() {
     phone TEXT,
     first_enquiry_at TIMESTAMPTZ,
     last_message_at TIMESTAMPTZ,
+
     area_wanted TEXT,
     budget_min INTEGER,
     budget_max INTEGER,
@@ -134,12 +179,20 @@ async function ensureSchema() {
     occupants TEXT,
     source_property TEXT,
     requirement_summary TEXT,
+
     status TEXT NOT NULL DEFAULT 'unknown',
     contact_type TEXT NOT NULL DEFAULT 'unknown',
+
+    contact_summary TEXT,
+    relationship_status TEXT,
+    classification_confidence DOUBLE PRECISION,
+    classification_updated_at TIMESTAMPTZ,
+
     analysis_confidence DOUBLE PRECISION,
     analysis_notes TEXT,
     analysis_source TEXT,
     analysis_updated_at TIMESTAMPTZ,
+
     labels JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -159,18 +212,62 @@ async function ensureSchema() {
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   );
 
+  CREATE TABLE IF NOT EXISTS properties (
+    id BIGSERIAL PRIMARY KEY,
+    owner_contact_id BIGINT REFERENCES renters(id) ON DELETE SET NULL,
+    source_contact_id BIGINT REFERENCES renters(id) ON DELETE SET NULL,
+    title TEXT,
+    area TEXT,
+    village TEXT,
+    address_text TEXT,
+    asking_rent INTEGER,
+    floor TEXT,
+    bedrooms INTEGER,
+    size_sqft INTEGER,
+    has_garden BOOLEAN,
+    has_rooftop BOOLEAN,
+    pets_allowed BOOLEAN,
+    parking_spaces INTEGER,
+    availability_text TEXT,
+    available_from DATE,
+    status TEXT NOT NULL DEFAULT 'unknown',
+    property_summary TEXT,
+    source_notes TEXT,
+    analysis_confidence DOUBLE PRECISION,
+    analysis_updated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS property_matches (
+    id BIGSERIAL PRIMARY KEY,
+    property_id BIGINT NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    renter_id BIGINT NOT NULL REFERENCES renters(id) ON DELETE CASCADE,
+    demand_type TEXT NOT NULL DEFAULT 'historical',
+    match_score INTEGER NOT NULL DEFAULT 0,
+    reasons TEXT,
+    status TEXT NOT NULL DEFAULT 'suggested',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(property_id, renter_id)
+  );
+
   ALTER TABLE renters
     ADD COLUMN IF NOT EXISTS contact_type TEXT NOT NULL DEFAULT 'unknown';
-
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS contact_summary TEXT;
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS relationship_status TEXT;
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS classification_confidence DOUBLE PRECISION;
+  ALTER TABLE renters
+    ADD COLUMN IF NOT EXISTS classification_updated_at TIMESTAMPTZ;
   ALTER TABLE renters
     ADD COLUMN IF NOT EXISTS analysis_confidence DOUBLE PRECISION;
-
   ALTER TABLE renters
     ADD COLUMN IF NOT EXISTS analysis_notes TEXT;
-
   ALTER TABLE renters
     ADD COLUMN IF NOT EXISTS analysis_source TEXT;
-
   ALTER TABLE renters
     ADD COLUMN IF NOT EXISTS analysis_updated_at TIMESTAMPTZ;
 
@@ -205,7 +302,9 @@ async function withDetachedFrameRetry(fn, retries = 2) {
 
       if (!transient || attempt === retries) throw err;
 
-      console.warn(`WhatsApp frame changed; retrying (${attempt + 1}/${retries})...`);
+      console.warn(
+        `WhatsApp frame changed; retrying (${attempt + 1}/${retries})...`
+      );
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
   }
@@ -213,12 +312,51 @@ async function withDetachedFrameRetry(fn, retries = 2) {
   throw lastErr;
 }
 
-async function upsertRenter(chat, labels = [], contactType = "unknown") {
-  const id = chat.id._serialized;
+function normaliseLabels(labels = []) {
+  return labels
+    .map(x => String(x || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function inferTypeFromLabels(labels = []) {
+  const names = normaliseLabels(labels);
+
+  if (TENANT_LABELS.some(x => names.includes(x.toLowerCase()))) {
+    return "existing_tenant";
+  }
+
+  if (LANDLORD_LABELS.some(x => names.includes(x.toLowerCase()))) {
+    return "landlord";
+  }
+
+  if (AGENT_LABELS.some(x => names.includes(x.toLowerCase()))) {
+    return "agent";
+  }
+
+  if (PROSPECT_LABELS.some(x => names.includes(x.toLowerCase()))) {
+    return "renter_prospect";
+  }
+
+  return "unknown";
+}
+
+function isCrmLabelled(labels = []) {
+  const names = normaliseLabels(labels);
+  const allowed = new Set(
+    CRM_IMPORT_LABELS.map(x => x.toLowerCase())
+  );
+  return names.some(name => allowed.has(name));
+}
+
+async function upsertContact(chat, labels = [], suggestedType = "unknown") {
+  const chatId = chat.id._serialized;
 
   let contact = null;
   try {
-    contact = await withDetachedFrameRetry(() => chat.getContact(), 1);
+    contact = await withDetachedFrameRetry(
+      () => chat.getContact(),
+      1
+    );
   } catch {}
 
   const displayName =
@@ -226,7 +364,7 @@ async function upsertRenter(chat, labels = [], contactType = "unknown") {
     (contact && (contact.pushname || contact.name)) ||
     null;
 
-  const phone = phoneFromChatId(id);
+  const phone = phoneFromChatId(chatId);
 
   const { rows } = await pool.query(`
     INSERT INTO renters
@@ -237,18 +375,26 @@ async function upsertRenter(chat, labels = [], contactType = "unknown") {
       phone = COALESCE(EXCLUDED.phone, renters.phone),
       labels = EXCLUDED.labels,
       contact_type = CASE
+        WHEN renters.classification_updated_at IS NOT NULL
+          THEN renters.contact_type
         WHEN EXCLUDED.contact_type = 'unknown'
           THEN renters.contact_type
         ELSE EXCLUDED.contact_type
       END,
       updated_at = NOW()
     RETURNING id
-  `, [id, displayName, phone, JSON.stringify(labels), contactType]);
+  `, [
+    chatId,
+    displayName,
+    phone,
+    JSON.stringify(labels),
+    suggestedType
+  ]);
 
   return rows[0].id;
 }
 
-async function saveMessage(chatId, renterId, message) {
+async function saveMessage(chatId, contactId, message) {
   const ts = message.timestamp
     ? new Date(message.timestamp * 1000)
     : new Date();
@@ -262,14 +408,14 @@ async function saveMessage(chatId, renterId, message) {
 
   const result = await pool.query(`
     INSERT INTO whatsapp_messages
-      (whatsapp_message_id, whatsapp_chat_id, renter_id, direction,
-       sender_name, body, message_type, message_at, raw)
+      (whatsapp_message_id, whatsapp_chat_id, renter_id,
+       direction, sender_name, body, message_type, message_at, raw)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
     ON CONFLICT (whatsapp_message_id) DO NOTHING
   `, [
     serializedId,
     chatId,
-    renterId,
+    contactId,
     direction,
     null,
     message.body || "",
@@ -287,23 +433,23 @@ async function saveMessage(chatId, renterId, message) {
   return result.rowCount;
 }
 
-async function updateRenterDates(renterId) {
+async function updateContactDates(contactId) {
   await pool.query(`
     UPDATE renters r SET
       first_enquiry_at = x.first_at,
       last_message_at = x.last_at,
       updated_at = NOW()
     FROM (
-      SELECT renter_id, MIN(message_at) first_at, MAX(message_at) last_at
+      SELECT renter_id,
+             MIN(message_at) first_at,
+             MAX(message_at) last_at
       FROM whatsapp_messages
       WHERE renter_id=$1
       GROUP BY renter_id
     ) x
     WHERE r.id=x.renter_id
-  `, [renterId]);
+  `, [contactId]);
 }
-
-
 
 function requireGptAuth(req, res, next) {
   if (!gptKey) {
@@ -324,7 +470,7 @@ function requireGptAuth(req, res, next) {
   next();
 }
 
-function nullableString(value, maxLength = 2000) {
+function nullableString(value, maxLength = 3000) {
   if (value === null || value === undefined || value === "") return null;
   return String(value).trim().slice(0, maxLength) || null;
 }
@@ -357,18 +503,72 @@ function nullableConfidence(value) {
   return Math.max(0, Math.min(1, n));
 }
 
-/*
- * Private Custom GPT bridge.
- * These endpoints read only imported prospective-renter records and their
- * stored WhatsApp messages. They do not control WhatsApp or send messages.
- */
+function clampScore(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function validContactType(value) {
+  const allowed = new Set([
+    "renter_prospect",
+    "existing_tenant",
+    "landlord",
+    "agent",
+    "other_rental_contact",
+    "unrelated",
+    "unknown"
+  ]);
+  const v = String(value || "unknown").trim().toLowerCase();
+  return allowed.has(v) ? v : null;
+}
+
+function validRenterStatus(value) {
+  const allowed = new Set([
+    "active",
+    "historical",
+    "closed",
+    "unknown",
+    "not_prospect"
+  ]);
+  const v = String(value || "unknown").trim().toLowerCase();
+  return allowed.has(v) ? v : null;
+}
+
+async function getContactMessages(contactId, limit = 500, offset = 0) {
+  const totalResult = await pool.query(`
+    SELECT COUNT(*)::int AS count
+    FROM whatsapp_messages
+    WHERE renter_id=$1
+  `, [contactId]);
+
+  const total = totalResult.rows[0].count;
+
+  const messagesResult = await pool.query(`
+    SELECT direction, body, message_type, message_at, id
+    FROM whatsapp_messages
+    WHERE renter_id=$1
+    ORDER BY message_at ASC NULLS FIRST, id ASC
+    LIMIT $2 OFFSET $3
+  `, [contactId, limit, offset]);
+
+  return {
+    total,
+    messages: messagesResult.rows,
+    hasMore: offset + messagesResult.rows.length < total
+  };
+}
+
+/* ---------------- GPT CRM API ---------------- */
+
 app.get("/gpt/health", requireGptAuth, async (req, res) => {
   try {
     await pool.query("SELECT 1");
     res.json({
       ok: true,
       service: "zheungyuan-rental-crm",
-      gptBridge: true
+      gptBridge: true,
+      crmVersion: "2.0"
     });
   } catch (err) {
     res.status(500).json({
@@ -378,30 +578,74 @@ app.get("/gpt/health", requireGptAuth, async (req, res) => {
   }
 });
 
-app.get("/gpt/prospects", requireGptAuth, async (req, res) => {
+app.get("/gpt/overview", requireGptAuth, async (req, res) => {
+  try {
+    const contacts = await pool.query(`
+      SELECT
+        COUNT(*)::int total,
+        COUNT(*) FILTER (WHERE contact_type='renter_prospect')::int renters,
+        COUNT(*) FILTER (WHERE contact_type='existing_tenant')::int tenants,
+        COUNT(*) FILTER (WHERE contact_type='landlord')::int landlords,
+        COUNT(*) FILTER (WHERE contact_type='agent')::int agents,
+        COUNT(*) FILTER (WHERE classification_updated_at IS NOT NULL)::int reviewed
+      FROM renters
+      WHERE contact_type <> 'unrelated'
+    `);
+
+    const messages = await pool.query(`
+      SELECT COUNT(*)::int count FROM whatsapp_messages
+    `);
+
+    const properties = await pool.query(`
+      SELECT
+        COUNT(*)::int total,
+        COUNT(*) FILTER (WHERE status='available')::int available
+      FROM properties
+    `);
+
+    const matches = await pool.query(`
+      SELECT COUNT(*)::int count FROM property_matches
+    `);
+
+    res.json({
+      ok: true,
+      contacts: contacts.rows[0],
+      messages: messages.rows[0].count,
+      properties: properties.rows[0],
+      matches: matches.rows[0].count
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.get("/gpt/contacts", requireGptAuth, async (req, res) => {
   const limit = Math.max(
     1,
-    Math.min(Number(req.query.limit || 25), 100)
+    Math.min(Number(req.query.limit || 100), 250)
   );
 
-  const analysis = String(req.query.analysis || "unreviewed")
+  const analysis = String(req.query.analysis || "all")
     .trim()
     .toLowerCase();
 
-  const status = nullableString(req.query.status, 40);
+  const type = nullableString(req.query.type, 50);
 
-  const where = ["r.contact_type = 'renter_prospect'"];
+  const where = [];
   const values = [];
 
   if (analysis === "unreviewed") {
-    where.push("r.analysis_updated_at IS NULL");
+    where.push("classification_updated_at IS NULL");
   } else if (analysis === "analysed" || analysis === "analyzed") {
-    where.push("r.analysis_updated_at IS NOT NULL");
+    where.push("classification_updated_at IS NOT NULL");
   }
 
-  if (status) {
-    values.push(status);
-    where.push(`r.status = $${values.length}`);
+  if (type) {
+    values.push(type);
+    where.push(`contact_type=$${values.length}`);
   }
 
   values.push(limit);
@@ -413,37 +657,32 @@ app.get("/gpt/prospects", requireGptAuth, async (req, res) => {
         r.id,
         r.display_name,
         r.phone,
+        r.contact_type,
+        r.contact_summary,
+        r.relationship_status,
+        r.status,
         r.first_enquiry_at,
         r.last_message_at,
+        r.labels,
+        r.classification_confidence,
+        r.classification_updated_at,
+        r.requirement_summary,
         r.area_wanted,
         r.budget_min,
         r.budget_max,
-        r.bedrooms,
         r.preferred_floor,
-        r.wants_garden,
-        r.wants_rooftop,
         r.pets_required,
-        r.pet_details,
         r.parking_needed,
-        r.move_in_date,
-        r.occupants,
-        r.source_property,
-        r.requirement_summary,
-        r.status,
-        r.labels,
-        r.analysis_confidence,
-        r.analysis_notes,
-        r.analysis_source,
         r.analysis_updated_at,
         (
           SELECT COUNT(*)::int
           FROM whatsapp_messages wm
-          WHERE wm.renter_id = r.id
-        ) AS message_count
+          WHERE wm.renter_id=r.id
+        ) message_count
       FROM renters r
-      WHERE ${where.join(" AND ")}
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
       ORDER BY
-        r.analysis_updated_at ASC NULLS FIRST,
+        r.classification_updated_at ASC NULLS FIRST,
         r.last_message_at DESC NULLS LAST,
         r.id DESC
       LIMIT $${limitPos}
@@ -453,10 +692,274 @@ app.get("/gpt/prospects", requireGptAuth, async (req, res) => {
       ok: true,
       count: rows.length,
       analysis,
+      contacts: rows
+    });
+  } catch (err) {
+    console.error("GPT contacts list failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.get(
+  "/gpt/contacts/:id/conversation",
+  requireGptAuth,
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid contact id"
+      });
+    }
+
+    const limit = Math.max(
+      20,
+      Math.min(Number(req.query.limit || 500), 500)
+    );
+    const offset = Math.max(0, Number(req.query.offset || 0));
+
+    try {
+      const contactResult = await pool.query(`
+        SELECT *
+        FROM renters
+        WHERE id=$1
+      `, [id]);
+
+      if (!contactResult.rows.length) {
+        return res.status(404).json({
+          ok: false,
+          error: "Contact not found"
+        });
+      }
+
+      const result = await getContactMessages(id, limit, offset);
+
+      res.json({
+        ok: true,
+        contact: contactResult.rows[0],
+        totalMessages: result.total,
+        offset,
+        returned: result.messages.length,
+        hasMore: result.hasMore,
+        nextOffset: result.hasMore
+          ? offset + result.messages.length
+          : null,
+        messages: result.messages
+      });
+    } catch (err) {
+      console.error("GPT contact conversation failed:", err);
+      res.status(500).json({
+        ok: false,
+        error: String(err && (err.message || err))
+      });
+    }
+  }
+);
+
+app.post(
+  "/gpt/contacts/:id/analysis",
+  requireGptAuth,
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid contact id"
+      });
+    }
+
+    const body = req.body || {};
+    const contactType = validContactType(body.contact_type);
+
+    if (!contactType) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid contact_type"
+      });
+    }
+
+    const renterStatus = validRenterStatus(body.status || "unknown");
+    if (!renterStatus) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid renter status"
+      });
+    }
+
+    const data = {
+      contact_summary: nullableString(body.contact_summary, 4000),
+      relationship_status:
+        nullableString(body.relationship_status, 200),
+      classification_confidence:
+        nullableConfidence(body.classification_confidence),
+
+      area_wanted: nullableString(body.area_wanted, 500),
+      budget_min: nullableInteger(body.budget_min),
+      budget_max: nullableInteger(body.budget_max),
+      bedrooms: nullableInteger(body.bedrooms),
+      preferred_floor: nullableString(body.preferred_floor, 100),
+      wants_garden: nullableBoolean(body.wants_garden),
+      wants_rooftop: nullableBoolean(body.wants_rooftop),
+      pets_required: nullableBoolean(body.pets_required),
+      pet_details: nullableString(body.pet_details, 500),
+      parking_needed: nullableBoolean(body.parking_needed),
+      move_in_date: nullableDate(body.move_in_date),
+      occupants: nullableString(body.occupants, 500),
+      source_property: nullableString(body.source_property, 800),
+      requirement_summary:
+        nullableString(body.requirement_summary, 3000),
+      status: renterStatus,
+      analysis_confidence:
+        nullableConfidence(body.analysis_confidence),
+      analysis_notes: nullableString(body.analysis_notes, 3000)
+    };
+
+    if (
+      data.budget_min != null &&
+      data.budget_max != null &&
+      data.budget_min > data.budget_max
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "budget_min cannot exceed budget_max"
+      });
+    }
+
+    try {
+      const { rows } = await pool.query(`
+        UPDATE renters SET
+          contact_type=$2,
+          contact_summary=$3,
+          relationship_status=$4,
+          classification_confidence=$5,
+          classification_updated_at=NOW(),
+
+          area_wanted=$6,
+          budget_min=$7,
+          budget_max=$8,
+          bedrooms=$9,
+          preferred_floor=$10,
+          wants_garden=$11,
+          wants_rooftop=$12,
+          pets_required=$13,
+          pet_details=$14,
+          parking_needed=$15,
+          move_in_date=$16,
+          occupants=$17,
+          source_property=$18,
+          requirement_summary=$19,
+          status=$20,
+          analysis_confidence=$21,
+          analysis_notes=$22,
+          analysis_source='custom_gpt',
+          analysis_updated_at=NOW(),
+          updated_at=NOW()
+        WHERE id=$1
+        RETURNING *
+      `, [
+        id,
+        contactType,
+        data.contact_summary,
+        data.relationship_status,
+        data.classification_confidence,
+        data.area_wanted,
+        data.budget_min,
+        data.budget_max,
+        data.bedrooms,
+        data.preferred_floor,
+        data.wants_garden,
+        data.wants_rooftop,
+        data.pets_required,
+        data.pet_details,
+        data.parking_needed,
+        data.move_in_date,
+        data.occupants,
+        data.source_property,
+        data.requirement_summary,
+        data.status,
+        data.analysis_confidence,
+        data.analysis_notes
+      ]);
+
+      if (!rows.length) {
+        return res.status(404).json({
+          ok: false,
+          error: "Contact not found"
+        });
+      }
+
+      res.json({
+        ok: true,
+        contact: rows[0]
+      });
+    } catch (err) {
+      console.error("GPT contact analysis save failed:", err);
+      res.status(500).json({
+        ok: false,
+        error: String(err && (err.message || err))
+      });
+    }
+  }
+);
+
+/* Backwards-compatible prospect endpoints */
+
+app.get("/gpt/prospects", requireGptAuth, async (req, res) => {
+  const limit = Math.max(
+    1,
+    Math.min(Number(req.query.limit || 100), 250)
+  );
+
+  const analysis = String(req.query.analysis || "unreviewed")
+    .trim()
+    .toLowerCase();
+
+  const status = nullableString(req.query.status, 40);
+
+  const where = ["r.contact_type='renter_prospect'"];
+  const values = [];
+
+  if (analysis === "unreviewed") {
+    where.push("r.analysis_updated_at IS NULL");
+  } else if (analysis === "analysed" || analysis === "analyzed") {
+    where.push("r.analysis_updated_at IS NOT NULL");
+  }
+
+  if (status) {
+    values.push(status);
+    where.push(`r.status=$${values.length}`);
+  }
+
+  values.push(limit);
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        r.*,
+        (
+          SELECT COUNT(*)::int
+          FROM whatsapp_messages wm
+          WHERE wm.renter_id=r.id
+        ) message_count
+      FROM renters r
+      WHERE ${where.join(" AND ")}
+      ORDER BY
+        r.analysis_updated_at ASC NULLS FIRST,
+        r.last_message_at DESC NULLS LAST,
+        r.id DESC
+      LIMIT $${values.length}
+    `, values);
+
+    res.json({
+      ok: true,
+      count: rows.length,
+      analysis,
       prospects: rows
     });
   } catch (err) {
-    console.error("GPT prospect list failed:", err);
     res.status(500).json({
       ok: false,
       error: String(err && (err.message || err))
@@ -469,6 +972,11 @@ app.get(
   requireGptAuth,
   async (req, res) => {
     const id = Number(req.params.id);
+    const limit = Math.max(
+      20,
+      Math.min(Number(req.query.limit || 500), 500)
+    );
+
     if (!Number.isInteger(id) || id < 1) {
       return res.status(400).json({
         ok: false,
@@ -476,41 +984,12 @@ app.get(
       });
     }
 
-    const limit = Math.max(
-      20,
-      Math.min(Number(req.query.limit || 250), 500)
-    );
-
     try {
       const prospectResult = await pool.query(`
-        SELECT
-          id,
-          display_name,
-          phone,
-          first_enquiry_at,
-          last_message_at,
-          labels,
-          status,
-          area_wanted,
-          budget_min,
-          budget_max,
-          bedrooms,
-          preferred_floor,
-          wants_garden,
-          wants_rooftop,
-          pets_required,
-          pet_details,
-          parking_needed,
-          move_in_date,
-          occupants,
-          source_property,
-          requirement_summary,
-          analysis_confidence,
-          analysis_notes,
-          analysis_updated_at
+        SELECT *
         FROM renters
-        WHERE id = $1
-          AND contact_type = 'renter_prospect'
+        WHERE id=$1
+          AND contact_type='renter_prospect'
       `, [id]);
 
       if (!prospectResult.rows.length) {
@@ -520,26 +999,17 @@ app.get(
         });
       }
 
-      const messagesResult = await pool.query(`
-        SELECT direction, body, message_type, message_at
-        FROM (
-          SELECT direction, body, message_type, message_at, id
-          FROM whatsapp_messages
-          WHERE renter_id = $1
-          ORDER BY message_at DESC NULLS LAST, id DESC
-          LIMIT $2
-        ) recent
-        ORDER BY message_at ASC NULLS FIRST, id ASC
-      `, [id, limit]);
+      const result = await getContactMessages(id, limit, 0);
 
       res.json({
         ok: true,
         prospect: prospectResult.rows[0],
-        messageCount: messagesResult.rows.length,
-        messages: messagesResult.rows
+        messageCount: result.messages.length,
+        totalMessages: result.total,
+        hasMore: result.hasMore,
+        messages: result.messages
       });
     } catch (err) {
-      console.error("GPT conversation fetch failed:", err);
       res.status(500).json({
         ok: false,
         error: String(err && (err.message || err))
@@ -561,20 +1031,9 @@ app.post(
     }
 
     const body = req.body || {};
-    const validStatuses = new Set([
-      "active",
-      "historical",
-      "closed",
-      "unknown",
-      "not_prospect"
-    ]);
+    const status = validRenterStatus(body.status || "unknown");
 
-    const status =
-      body.status == null
-        ? null
-        : String(body.status).trim().toLowerCase();
-
-    if (status && !validStatuses.has(status)) {
+    if (!status) {
       return res.status(400).json({
         ok: false,
         error: "Invalid status"
@@ -595,79 +1054,40 @@ app.post(
       move_in_date: nullableDate(body.move_in_date),
       occupants: nullableString(body.occupants, 500),
       source_property: nullableString(body.source_property, 800),
-      requirement_summary: nullableString(body.requirement_summary, 3000),
-      status: status || "unknown",
-      analysis_confidence: nullableConfidence(body.analysis_confidence),
+      requirement_summary:
+        nullableString(body.requirement_summary, 3000),
+      status,
+      analysis_confidence:
+        nullableConfidence(body.analysis_confidence),
       analysis_notes: nullableString(body.analysis_notes, 3000)
     };
 
-    if (
-      data.budget_min != null &&
-      data.budget_max != null &&
-      data.budget_min > data.budget_max
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "budget_min cannot exceed budget_max"
-      });
-    }
-
-    if (data.bedrooms != null && (data.bedrooms < 0 || data.bedrooms > 20)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid bedrooms value"
-      });
-    }
-
     try {
       const { rows } = await pool.query(`
-        UPDATE renters
-        SET
-          area_wanted = $2,
-          budget_min = $3,
-          budget_max = $4,
-          bedrooms = $5,
-          preferred_floor = $6,
-          wants_garden = $7,
-          wants_rooftop = $8,
-          pets_required = $9,
-          pet_details = $10,
-          parking_needed = $11,
-          move_in_date = $12,
-          occupants = $13,
-          source_property = $14,
-          requirement_summary = $15,
-          status = $16,
-          analysis_confidence = $17,
-          analysis_notes = $18,
-          analysis_source = 'custom_gpt',
-          analysis_updated_at = NOW(),
-          updated_at = NOW()
-        WHERE id = $1
-          AND contact_type = 'renter_prospect'
-        RETURNING
-          id,
-          display_name,
-          phone,
-          area_wanted,
-          budget_min,
-          budget_max,
-          bedrooms,
-          preferred_floor,
-          wants_garden,
-          wants_rooftop,
-          pets_required,
-          pet_details,
-          parking_needed,
-          move_in_date,
-          occupants,
-          source_property,
-          requirement_summary,
-          status,
-          analysis_confidence,
-          analysis_notes,
-          analysis_source,
-          analysis_updated_at
+        UPDATE renters SET
+          area_wanted=$2,
+          budget_min=$3,
+          budget_max=$4,
+          bedrooms=$5,
+          preferred_floor=$6,
+          wants_garden=$7,
+          wants_rooftop=$8,
+          pets_required=$9,
+          pet_details=$10,
+          parking_needed=$11,
+          move_in_date=$12,
+          occupants=$13,
+          source_property=$14,
+          requirement_summary=$15,
+          status=$16,
+          analysis_confidence=$17,
+          analysis_notes=$18,
+          analysis_source='custom_gpt',
+          analysis_updated_at=NOW(),
+          updated_at=NOW()
+        WHERE id=$1
+          AND contact_type='renter_prospect'
+        RETURNING *
       `, [
         id,
         data.area_wanted,
@@ -701,7 +1121,6 @@ app.post(
         prospect: rows[0]
       });
     } catch (err) {
-      console.error("GPT prospect analysis save failed:", err);
       res.status(500).json({
         ok: false,
         error: String(err && (err.message || err))
@@ -710,18 +1129,338 @@ app.post(
   }
 );
 
-const PROSPECT_LABELS = ["To organise viewing", "Viewings -"];
+/* Property API */
 
-async function findProspectChats({
-  limitChats = 20,
-  scanLimit = 1000
+app.get("/gpt/properties", requireGptAuth, async (req, res) => {
+  const status = nullableString(req.query.status, 40);
+  const contactId = nullableInteger(req.query.contact_id);
+  const values = [];
+  const where = [];
+
+  if (status) {
+    values.push(status);
+    where.push(`p.status=$${values.length}`);
+  }
+
+  if (contactId) {
+    values.push(contactId);
+    where.push(
+      `(p.owner_contact_id=$${values.length} OR p.source_contact_id=$${values.length})`
+    );
+  }
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        p.*,
+        owner.display_name owner_name,
+        source.display_name source_name
+      FROM properties p
+      LEFT JOIN renters owner ON owner.id=p.owner_contact_id
+      LEFT JOIN renters source ON source.id=p.source_contact_id
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY p.updated_at DESC, p.id DESC
+      LIMIT 250
+    `, values);
+
+    res.json({
+      ok: true,
+      count: rows.length,
+      properties: rows
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+function propertyData(body = {}) {
+  return {
+    owner_contact_id: nullableInteger(body.owner_contact_id),
+    source_contact_id: nullableInteger(body.source_contact_id),
+    title: nullableString(body.title, 500),
+    area: nullableString(body.area, 300),
+    village: nullableString(body.village, 300),
+    address_text: nullableString(body.address_text, 800),
+    asking_rent: nullableInteger(body.asking_rent),
+    floor: nullableString(body.floor, 100),
+    bedrooms: nullableInteger(body.bedrooms),
+    size_sqft: nullableInteger(body.size_sqft),
+    has_garden: nullableBoolean(body.has_garden),
+    has_rooftop: nullableBoolean(body.has_rooftop),
+    pets_allowed: nullableBoolean(body.pets_allowed),
+    parking_spaces: nullableInteger(body.parking_spaces),
+    availability_text:
+      nullableString(body.availability_text, 500),
+    available_from: nullableDate(body.available_from),
+    status: nullableString(body.status, 40) || "unknown",
+    property_summary:
+      nullableString(body.property_summary, 3000),
+    source_notes: nullableString(body.source_notes, 3000),
+    analysis_confidence:
+      nullableConfidence(body.analysis_confidence)
+  };
+}
+
+app.post("/gpt/properties", requireGptAuth, async (req, res) => {
+  const d = propertyData(req.body || {});
+
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO properties (
+        owner_contact_id,
+        source_contact_id,
+        title,
+        area,
+        village,
+        address_text,
+        asking_rent,
+        floor,
+        bedrooms,
+        size_sqft,
+        has_garden,
+        has_rooftop,
+        pets_allowed,
+        parking_spaces,
+        availability_text,
+        available_from,
+        status,
+        property_summary,
+        source_notes,
+        analysis_confidence,
+        analysis_updated_at
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW()
+      )
+      RETURNING *
+    `, [
+      d.owner_contact_id,
+      d.source_contact_id,
+      d.title,
+      d.area,
+      d.village,
+      d.address_text,
+      d.asking_rent,
+      d.floor,
+      d.bedrooms,
+      d.size_sqft,
+      d.has_garden,
+      d.has_rooftop,
+      d.pets_allowed,
+      d.parking_spaces,
+      d.availability_text,
+      d.available_from,
+      d.status,
+      d.property_summary,
+      d.source_notes,
+      d.analysis_confidence
+    ]);
+
+    res.json({
+      ok: true,
+      property: rows[0]
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.post(
+  "/gpt/properties/:id",
+  requireGptAuth,
+  async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid property id"
+      });
+    }
+
+    const d = propertyData(req.body || {});
+
+    try {
+      const { rows } = await pool.query(`
+        UPDATE properties SET
+          owner_contact_id=$2,
+          source_contact_id=$3,
+          title=$4,
+          area=$5,
+          village=$6,
+          address_text=$7,
+          asking_rent=$8,
+          floor=$9,
+          bedrooms=$10,
+          size_sqft=$11,
+          has_garden=$12,
+          has_rooftop=$13,
+          pets_allowed=$14,
+          parking_spaces=$15,
+          availability_text=$16,
+          available_from=$17,
+          status=$18,
+          property_summary=$19,
+          source_notes=$20,
+          analysis_confidence=$21,
+          analysis_updated_at=NOW(),
+          updated_at=NOW()
+        WHERE id=$1
+        RETURNING *
+      `, [
+        id,
+        d.owner_contact_id,
+        d.source_contact_id,
+        d.title,
+        d.area,
+        d.village,
+        d.address_text,
+        d.asking_rent,
+        d.floor,
+        d.bedrooms,
+        d.size_sqft,
+        d.has_garden,
+        d.has_rooftop,
+        d.pets_allowed,
+        d.parking_spaces,
+        d.availability_text,
+        d.available_from,
+        d.status,
+        d.property_summary,
+        d.source_notes,
+        d.analysis_confidence
+      ]);
+
+      if (!rows.length) {
+        return res.status(404).json({
+          ok: false,
+          error: "Property not found"
+        });
+      }
+
+      res.json({
+        ok: true,
+        property: rows[0]
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: String(err && (err.message || err))
+      });
+    }
+  }
+);
+
+/* Match API */
+
+app.get("/gpt/matches", requireGptAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        m.*,
+        p.title property_title,
+        p.area property_area,
+        r.display_name renter_name,
+        r.status renter_status,
+        r.requirement_summary
+      FROM property_matches m
+      JOIN properties p ON p.id=m.property_id
+      JOIN renters r ON r.id=m.renter_id
+      ORDER BY m.match_score DESC, m.updated_at DESC
+      LIMIT 500
+    `);
+
+    res.json({
+      ok: true,
+      count: rows.length,
+      matches: rows
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.post("/gpt/matches", requireGptAuth, async (req, res) => {
+  const body = req.body || {};
+  const propertyId = nullableInteger(body.property_id);
+  const renterId = nullableInteger(body.renter_id);
+
+  if (!propertyId || !renterId) {
+    return res.status(400).json({
+      ok: false,
+      error: "property_id and renter_id are required"
+    });
+  }
+
+  const demandType =
+    nullableString(body.demand_type, 40) || "historical";
+  const score = clampScore(body.match_score);
+  const reasons = nullableString(body.reasons, 3000);
+  const status =
+    nullableString(body.status, 40) || "suggested";
+
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO property_matches (
+        property_id,
+        renter_id,
+        demand_type,
+        match_score,
+        reasons,
+        status
+      )
+      VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (property_id, renter_id) DO UPDATE SET
+        demand_type=EXCLUDED.demand_type,
+        match_score=EXCLUDED.match_score,
+        reasons=EXCLUDED.reasons,
+        status=EXCLUDED.status,
+        updated_at=NOW()
+      RETURNING *
+    `, [
+      propertyId,
+      renterId,
+      demandType,
+      score,
+      reasons,
+      status
+    ]);
+
+    res.json({
+      ok: true,
+      match: rows[0]
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+/* ---------------- WhatsApp import ---------------- */
+
+async function findChatsByLabels({
+  labels = CRM_IMPORT_LABELS,
+  limitChats = Infinity,
+  scanLimit = Infinity
 } = {}) {
   const wanted = new Set(
-    PROSPECT_LABELS.map(x => x.trim().toLowerCase())
+    labels.map(x => String(x).trim().toLowerCase())
   );
 
-  const allChats =
-    await withDetachedFrameRetry(() => client.getChats());
+  const allChats = await withDetachedFrameRetry(
+    () => client.getChats()
+  );
 
   const directChats = allChats
     .filter(chat => !chat.isGroup)
@@ -729,7 +1468,6 @@ async function findProspectChats({
 
   const selected = [];
   let chatsScanned = 0;
-  let skippedExistingTenants = 0;
 
   const chatsToScan = Number.isFinite(scanLimit)
     ? directChats.slice(0, scanLimit)
@@ -738,56 +1476,52 @@ async function findProspectChats({
   for (const chat of chatsToScan) {
     chatsScanned++;
 
-    let chatLabels = [];
     try {
-      chatLabels = await withDetachedFrameRetry(
+      const chatLabels = await withDetachedFrameRetry(
         () => client.getChatLabels(chat.id._serialized),
         2
       );
+
+      const labelNames = chatLabels
+        .map(label => label.name)
+        .filter(Boolean);
+
+      const names = normaliseLabels(labelNames);
+      const isMatch = names.some(name => wanted.has(name));
+
+      if (!isMatch) continue;
+
+      selected.push({
+        chat,
+        labels: labelNames,
+        suggestedType: inferTypeFromLabels(labelNames)
+      });
+
+      if (
+        Number.isFinite(limitChats) &&
+        selected.length >= limitChats
+      ) {
+        break;
+      }
     } catch (err) {
       console.warn(
-        `Could not read labels for ${chat.id && chat.id._serialized}:`,
+        `Could not read labels for ${
+          chat.id && chat.id._serialized
+        }:`,
         String(err && (err.message || err))
       );
-      continue;
     }
-
-    const labelNames =
-      chatLabels.map(label => label.name).filter(Boolean);
-
-    const normalised =
-      labelNames.map(x => String(x).trim().toLowerCase());
-
-    // Current tenant-management conversations are deliberately excluded
-    // from the landlord-facing renter-demand database.
-    if (normalised.includes("tenants")) {
-      skippedExistingTenants++;
-      continue;
-    }
-
-    const isProspect =
-      normalised.some(name => wanted.has(name));
-
-    if (!isProspect) continue;
-
-    selected.push({
-      chat,
-      labels: labelNames
-    });
-
-    if (Number.isFinite(limitChats) && selected.length >= limitChats) break;
 
     await new Promise(resolve => setTimeout(resolve, 60));
   }
 
   return {
     chatsScanned,
-    skippedExistingTenants,
     selected
   };
 }
 
-function previewProspect(chat, labels) {
+function previewContact(chat, labels, suggestedType) {
   const chatId =
     chat && chat.id && chat.id._serialized
       ? chat.id._serialized
@@ -797,9 +1531,181 @@ function previewProspect(chat, labels) {
     name: chat.name || null,
     phone: phoneFromChatId(chatId),
     labels,
+    suggestedType,
     lastMessageAt: chat.timestamp
       ? new Date(chat.timestamp * 1000).toISOString()
       : null
+  };
+}
+
+app.get("/crm/preview", async (req, res) => {
+  if (!waReady) {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
+  }
+
+  try {
+    const result = await findChatsByLabels({
+      limitChats: 100,
+      scanLimit: 2000
+    });
+
+    res.json({
+      ok: true,
+      labels: CRM_IMPORT_LABELS,
+      chatsScanned: result.chatsScanned,
+      contactsFound: result.selected.length,
+      contacts: result.selected.map(
+        ({ chat, labels, suggestedType }) =>
+          previewContact(chat, labels, suggestedType)
+      )
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+async function runFullCrmImport() {
+  bulkImportState = {
+    running: true,
+    mode: "full_crm",
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    chatsScanned: 0,
+    matchingChatsFound: 0,
+    contactsProcessed: 0,
+    messagesRead: 0,
+    newMessagesSaved: 0,
+    currentContact: null,
+    error: null
+  };
+
+  try {
+    const result = await findChatsByLabels({
+      limitChats: Infinity,
+      scanLimit: Infinity
+    });
+
+    bulkImportState.chatsScanned = result.chatsScanned;
+    bulkImportState.matchingChatsFound = result.selected.length;
+
+    for (const item of result.selected) {
+      const { chat, labels, suggestedType } = item;
+      const chatId = chat.id._serialized;
+
+      bulkImportState.currentContact =
+        chat.name ||
+        phoneFromChatId(chatId) ||
+        chatId ||
+        "Unknown";
+
+      try {
+        const contactId = await upsertContact(
+          chat,
+          labels,
+          suggestedType
+        );
+
+        const messages = await withDetachedFrameRetry(
+          () => chat.fetchMessages({ limit: Infinity }),
+          2
+        );
+
+        bulkImportState.messagesRead += messages.length;
+
+        for (const message of messages) {
+          bulkImportState.newMessagesSaved += await saveMessage(
+            chatId,
+            contactId,
+            message
+          );
+        }
+
+        await updateContactDates(contactId);
+        bulkImportState.contactsProcessed++;
+      } catch (err) {
+        console.warn(
+          `Could not fully import contact ${chatId}:`,
+          String(err && (err.stack || err.message || err))
+        );
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+
+    bulkImportState.running = false;
+    bulkImportState.currentContact = null;
+    bulkImportState.completedAt = new Date().toISOString();
+  } catch (err) {
+    bulkImportState.running = false;
+    bulkImportState.currentContact = null;
+    bulkImportState.completedAt = new Date().toISOString();
+    bulkImportState.error = String(
+      err && (err.stack || err.message || err)
+    );
+    console.error("Full CRM import failed:", bulkImportState.error);
+  }
+}
+
+app.post("/sync/crm/all", async (req, res) => {
+  if (!waReady) {
+    return res.status(409).json({
+      ok: false,
+      error: "WhatsApp not connected"
+    });
+  }
+
+  if (syncState.running || bulkImportState.running) {
+    return res.status(409).json({
+      ok: false,
+      error: "A WhatsApp import is already running"
+    });
+  }
+
+  runFullCrmImport();
+
+  res.status(202).json({
+    ok: true,
+    started: true,
+    labels: CRM_IMPORT_LABELS,
+    message:
+      "Full rental CRM import started in the background."
+  });
+});
+
+app.get("/sync/crm/all/status", (req, res) => {
+  res.json({
+    ok: true,
+    ...bulkImportState
+  });
+});
+
+/* Existing prospect import retained */
+
+async function findProspectChats({
+  limitChats = 20,
+  scanLimit = 1000
+} = {}) {
+  const result = await findChatsByLabels({
+    labels: PROSPECT_LABELS,
+    limitChats,
+    scanLimit
+  });
+
+  result.selected = result.selected.filter(item => {
+    const names = normaliseLabels(item.labels);
+    return !names.includes("tenants");
+  });
+
+  return {
+    chatsScanned: result.chatsScanned,
+    skippedExistingTenants: 0,
+    selected: result.selected
   };
 }
 
@@ -815,36 +1721,31 @@ app.get("/prospects/preview", async (req, res) => {
     1,
     Math.min(Number(req.query.limit || 20), 50)
   );
-
   const scanLimit = Math.max(
     limitChats,
     Math.min(Number(req.query.scanLimit || 1000), 2000)
   );
 
   try {
-    const result =
-      await findProspectChats({ limitChats, scanLimit });
+    const result = await findProspectChats({
+      limitChats,
+      scanLimit
+    });
 
     res.json({
       ok: true,
       labels: PROSPECT_LABELS,
       chatsScanned: result.chatsScanned,
-      skippedExistingTenants: result.skippedExistingTenants,
       prospectsFound: result.selected.length,
-      prospects: result.selected.map(({ chat, labels }) =>
-        previewProspect(chat, labels)
+      prospects: result.selected.map(
+        ({ chat, labels, suggestedType }) =>
+          previewContact(chat, labels, suggestedType)
       )
     });
   } catch (err) {
-    const detail =
-      String(err && (err.stack || err.message || err));
-
-    console.error("Prospect preview failed:", detail);
-
     res.status(500).json({
       ok: false,
-      error: String(err && (err.message || err)),
-      detail
+      error: String(err && (err.message || err))
     });
   }
 });
@@ -857,7 +1758,7 @@ app.post("/sync/prospects", async (req, res) => {
     });
   }
 
-  if (syncState.running) {
+  if (syncState.running || bulkImportState.running) {
     return res.status(409).json({
       ok: false,
       error: "Sync already running"
@@ -865,64 +1766,54 @@ app.post("/sync/prospects", async (req, res) => {
   }
 
   const body = req.body || {};
-
   const limitChats = Math.max(
     1,
     Math.min(Number(body.limitChats || 20), 50)
   );
-
   const messagesPerChat = Math.max(
     20,
     Math.min(Number(body.messagesPerChat || 150), 500)
   );
-
   const scanLimit = Math.max(
     limitChats,
     Math.min(Number(body.scanLimit || 1000), 2000)
   );
 
   syncState.running = true;
-
   let chatsSeen = 0;
   let messagesSaved = 0;
 
   try {
-    const result =
-      await findProspectChats({ limitChats, scanLimit });
+    const result = await findProspectChats({
+      limitChats,
+      scanLimit
+    });
 
     for (const { chat, labels } of result.selected) {
       try {
-        const renterId =
-          await upsertRenter(
-            chat,
-            labels,
-            "renter_prospect"
-          );
+        const contactId = await upsertContact(
+          chat,
+          labels,
+          "renter_prospect"
+        );
 
-        const messages =
-          await withDetachedFrameRetry(
-            () => chat.fetchMessages({
-              limit: messagesPerChat
-            }),
-            2
-          );
+        const messages = await withDetachedFrameRetry(
+          () => chat.fetchMessages({ limit: messagesPerChat }),
+          2
+        );
 
         for (const message of messages) {
-          messagesSaved +=
-            await saveMessage(
-              chat.id._serialized,
-              renterId,
-              message
-            );
+          messagesSaved += await saveMessage(
+            chat.id._serialized,
+            contactId,
+            message
+          );
         }
 
-        await updateRenterDates(renterId);
+        await updateContactDates(contactId);
         chatsSeen++;
       } catch (err) {
-        console.warn(
-          `Could not import prospect ${chat.id && chat.id._serialized}:`,
-          String(err && (err.stack || err.message || err))
-        );
+        console.warn("Could not import prospect:", err);
       }
     }
 
@@ -935,40 +1826,31 @@ app.post("/sync/prospects", async (req, res) => {
 
     res.json({
       ok: true,
-      labels: PROSPECT_LABELS,
       chatsScanned: result.chatsScanned,
-      skippedExistingTenants: result.skippedExistingTenants,
       matchingProspectsFound: result.selected.length,
       ...syncState
     });
   } catch (err) {
     syncState.running = false;
-
-    const detail =
-      String(err && (err.stack || err.message || err));
-
-    console.error("Prospect sync failed:", detail);
-
     res.status(500).json({
       ok: false,
-      error: String(err && (err.message || err)),
-      detail
+      error: String(err && (err.message || err))
     });
   }
 });
 
-
 async function runFullProspectImport() {
   bulkImportState = {
     running: true,
+    mode: "prospects",
     startedAt: new Date().toISOString(),
     completedAt: null,
     chatsScanned: 0,
-    matchingProspectsFound: 0,
-    prospectsProcessed: 0,
+    matchingChatsFound: 0,
+    contactsProcessed: 0,
     messagesRead: 0,
     newMessagesSaved: 0,
-    currentProspect: null,
+    currentContact: null,
     error: null
   };
 
@@ -979,18 +1861,15 @@ async function runFullProspectImport() {
     });
 
     bulkImportState.chatsScanned = result.chatsScanned;
-    bulkImportState.matchingProspectsFound = result.selected.length;
+    bulkImportState.matchingChatsFound = result.selected.length;
 
     for (const { chat, labels } of result.selected) {
-      const chatId = chat && chat.id && chat.id._serialized
-        ? chat.id._serialized
-        : "";
-
-      bulkImportState.currentProspect =
-        chat.name || phoneFromChatId(chatId) || chatId || "Unknown";
+      const chatId = chat.id._serialized;
+      bulkImportState.currentContact =
+        chat.name || phoneFromChatId(chatId) || "Unknown";
 
       try {
-        const renterId = await upsertRenter(
+        const contactId = await upsertContact(
           chat,
           labels,
           "renter_prospect"
@@ -1006,38 +1885,26 @@ async function runFullProspectImport() {
         for (const message of messages) {
           bulkImportState.newMessagesSaved += await saveMessage(
             chatId,
-            renterId,
+            contactId,
             message
           );
         }
 
-        await updateRenterDates(renterId);
-        bulkImportState.prospectsProcessed++;
+        await updateContactDates(contactId);
+        bulkImportState.contactsProcessed++;
       } catch (err) {
-        console.warn(
-          `Could not fully import prospect ${chatId}:`,
-          String(err && (err.stack || err.message || err))
-        );
+        console.warn("Could not fully import prospect:", err);
       }
-
-      await new Promise(resolve => setTimeout(resolve, 120));
     }
 
     bulkImportState.running = false;
-    bulkImportState.currentProspect = null;
+    bulkImportState.currentContact = null;
     bulkImportState.completedAt = new Date().toISOString();
-
-    console.log(
-      `Full prospect import complete: ${bulkImportState.prospectsProcessed} prospects, ` +
-      `${bulkImportState.messagesRead} messages read, ` +
-      `${bulkImportState.newMessagesSaved} new messages saved`
-    );
   } catch (err) {
     bulkImportState.running = false;
-    bulkImportState.currentProspect = null;
-    bulkImportState.completedAt = new Date().toISOString();
-    bulkImportState.error = String(err && (err.stack || err.message || err));
-    console.error("Full prospect import failed:", bulkImportState.error);
+    bulkImportState.error = String(
+      err && (err.stack || err.message || err)
+    );
   }
 }
 
@@ -1058,11 +1925,9 @@ app.post("/sync/prospects/all", async (req, res) => {
 
   runFullProspectImport();
 
-  return res.status(202).json({
+  res.status(202).json({
     ok: true,
-    started: true,
-    message:
-      "Full historical prospect import started. All matching labelled chats and all available messages will be imported."
+    started: true
   });
 });
 
@@ -1073,7 +1938,11 @@ app.get("/sync/prospects/all/status", (req, res) => {
   });
 });
 
+/* ---------------- Reader UI ---------------- */
+
 app.get("/", (req, res) => {
+  const labelText = CRM_IMPORT_LABELS.join(", ");
+
   res.type("html").send(`
   <html>
     <head>
@@ -1084,7 +1953,7 @@ app.get("/", (req, res) => {
           background:#f2eee3;
           color:#172922;
           padding:38px;
-          max-width:900px;
+          max-width:960px;
           margin:auto
         }
         h1{
@@ -1114,176 +1983,91 @@ app.get("/", (req, res) => {
           cursor:pointer
         }
         button:disabled{opacity:.5;cursor:not-allowed}
-        input{
-          padding:10px;
-          border:1px solid #cfc8bc;
-          width:90px
-        }
-        label{display:inline-block;margin-right:18px}
         pre{
           white-space:pre-wrap;
           background:#f7f4ee;
           padding:14px;
-          border:1px solid #ddd5c8
+          border:1px solid #ddd5c8;
+          max-height:420px;
+          overflow:auto
+        }
+        .warn{
+          background:#fff8e8;
+          border:1px solid #e6d19b;
+          padding:13px;
+          line-height:1.5
         }
       </style>
     </head>
     <body>
       <div class="tag">張園 / Zheungyuan</div>
-      <h1>WhatsApp rental reader</h1>
+      <h1>WhatsApp rental CRM reader</h1>
 
       <div class="box">
-        Status: <b>${waReady ? "Connected" : "Waiting for WhatsApp"}</b>
+        WhatsApp:
+        <b>${waReady ? "Connected" : "Waiting for WhatsApp"}</b>
+        <br><br>
+        Custom GPT:
+        <b>${gptKey ? "Configured" : "READER_GPT_KEY not set"}</b>
       </div>
 
       <div class="box">
-        <a href="/qr">Open QR pairing</a><br><br>
-        <a href="/status">Status JSON</a><br><br>
-        <a href="/labels">Preview WhatsApp labels</a>
+        <a href="/qr">QR pairing</a> ·
+        <a href="/status">Status JSON</a> ·
+        <a href="/labels">WhatsApp labels</a> ·
+        <a href="/crm/preview">Preview rental CRM chats</a>
       </div>
 
       <div class="box">
-        <h3>Custom GPT bridge</h3>
+        <h3>Full rental CRM import</h3>
         <p>
-          Status: <b>${gptKey ? "Configured" : "READER_GPT_KEY not set"}</b>
+          Imports the complete available message history from chats carrying
+          recognised rental labels.
         </p>
-        <p>
-          The private GPT can read imported prospect conversations and save
-          structured renter requirements. It cannot send WhatsApp messages.
-        </p>
-      </div>
+        <p><b>Current included labels:</b> ${labelText}</p>
 
-      <div class="box">
-        <h3>Prospective renter demand</h3>
-        <p>
-          Uses only <b>To organise viewing</b> and <b>Viewings -</b>.
-          Chats carrying the <b>Tenants</b> label are excluded automatically.
-        </p>
-
-        <label>
-          Prospects
-          <input id="limitChats" type="number" min="1" max="50" value="20">
-        </label>
-
-        <label>
-          Messages per prospect
-          <input id="messagesPerChat" type="number" min="20" max="500" value="150">
-        </label>
+        <div class="warn">
+          Private/unlabelled chats are deliberately not imported. To include a
+          landlord chat that is currently unlabelled, apply a
+          <b>Landlords</b> label in WhatsApp (or add its label name to the
+          Railway variable <b>CRM_EXTRA_LABELS</b>) and rerun this import.
+        </div>
 
         <div style="margin-top:18px">
-          <button id="previewBtn" onclick="previewProspects()" ${waReady ? "" : "disabled"}>
-            Preview prospects
-          </button>
-          <button id="syncBtn" onclick="syncProspects()" ${waReady ? "" : "disabled"} style="margin-left:8px">
-            Import selected sample
-          </button>
-        </div>
-
-        <pre id="result">Preview the prospects before importing them.</pre>
-
-        <div style="margin-top:24px;padding-top:22px;border-top:1px solid #d8d1c4">
-          <h3>Full historical import</h3>
-          <p>
-            Imports <b>every direct chat</b> carrying either prospect label,
-            still excludes <b>Tenants</b>, and loads the <b>complete available
-            WhatsApp message history</b> for each matched prospect.
-          </p>
           <button
-            id="bulkSyncBtn"
-            onclick="startFullProspectImport()"
+            id="crmBtn"
+            onclick="startCrmImport()"
             ${waReady ? "" : "disabled"}
           >
-            Import ALL prospect leads + full message history
+            Import ALL rental CRM chats + ALL messages
           </button>
-          <pre id="bulkResult">Full import has not been started.</pre>
         </div>
+
+        <pre id="crmResult">Full CRM import has not been started.</pre>
       </div>
 
       <script>
-        function prospectSettings() {
-          return {
-            limitChats: Number(
-              document.getElementById("limitChats").value || 20
-            ),
-            messagesPerChat: Number(
-              document.getElementById("messagesPerChat").value || 150
-            ),
-            scanLimit: 1000
-          };
-        }
+        let timer = null;
 
-        async function previewProspects() {
-          const btn = document.getElementById("previewBtn");
-          const result = document.getElementById("result");
-          const settings = prospectSettings();
-
-          btn.disabled = true;
-          result.textContent =
-            "Scanning for historical viewing / enquiry leads…";
+        async function refreshCrmStatus() {
+          const result = document.getElementById("crmResult");
+          const btn = document.getElementById("crmBtn");
 
           try {
-            const response = await fetch(
-              "/prospects/preview?limit=" +
-              encodeURIComponent(settings.limitChats) +
-              "&scanLimit=" +
-              encodeURIComponent(settings.scanLimit)
-            );
-
-            const data = await response.json();
-            result.textContent = JSON.stringify(data, null, 2);
-          } catch (err) {
-            result.textContent = "Error: " + err.message;
-          } finally {
-            btn.disabled = false;
-          }
-        }
-
-        async function syncProspects() {
-          const btn = document.getElementById("syncBtn");
-          const result = document.getElementById("result");
-          const settings = prospectSettings();
-
-          btn.disabled = true;
-          result.textContent = "Importing prospective renter conversations…";
-
-          try {
-            const response = await fetch("/sync/prospects", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(settings)
-            });
-
-            const data = await response.json();
-            result.textContent = JSON.stringify(data, null, 2);
-          } catch (err) {
-            result.textContent = "Error: " + err.message;
-          } finally {
-            btn.disabled = false;
-          }
-        }
-
-
-        let fullImportTimer = null;
-
-        async function refreshFullImportStatus() {
-          const result = document.getElementById("bulkResult");
-          const btn = document.getElementById("bulkSyncBtn");
-
-          try {
-            const response = await fetch("/sync/prospects/all/status");
+            const response = await fetch("/sync/crm/all/status");
             const data = await response.json();
             result.textContent = JSON.stringify(data, null, 2);
 
             if (data.running) {
               btn.disabled = true;
-              if (!fullImportTimer) {
-                fullImportTimer = setInterval(refreshFullImportStatus, 3000);
+              if (!timer) {
+                timer = setInterval(refreshCrmStatus, 3000);
               }
             } else {
               btn.disabled = false;
-              if (fullImportTimer) {
-                clearInterval(fullImportTimer);
-                fullImportTimer = null;
+              if (timer) {
+                clearInterval(timer);
+                timer = null;
               }
             }
           } catch (err) {
@@ -1291,40 +2075,27 @@ app.get("/", (req, res) => {
           }
         }
 
-        async function startFullProspectImport() {
-          const btn = document.getElementById("bulkSyncBtn");
-          const result = document.getElementById("bulkResult");
-
+        async function startCrmImport() {
           const ok = window.confirm(
-            "Import every matching prospect chat and its complete available WhatsApp message history? This can take several minutes."
+            "Import every recognised rental CRM chat and its complete available WhatsApp history?"
           );
           if (!ok) return;
 
-          btn.disabled = true;
-          result.textContent = "Starting full historical import…";
+          document.getElementById("crmBtn").disabled = true;
 
-          try {
-            const response = await fetch("/sync/prospects/all", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" }
-            });
-            const data = await response.json();
+          const response = await fetch("/sync/crm/all", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"}
+          });
 
-            if (!response.ok) {
-              result.textContent = JSON.stringify(data, null, 2);
-              btn.disabled = false;
-              return;
-            }
+          const data = await response.json();
+          document.getElementById("crmResult").textContent =
+            JSON.stringify(data, null, 2);
 
-            result.textContent = JSON.stringify(data, null, 2);
-            await refreshFullImportStatus();
-          } catch (err) {
-            result.textContent = "Error: " + err.message;
-            btn.disabled = false;
-          }
+          await refreshCrmStatus();
         }
 
-        refreshFullImportStatus();
+        refreshCrmStatus();
       </script>
     </body>
   </html>`);
@@ -1346,13 +2117,18 @@ app.get("/qr", (req, res) => {
   res.type("html").send(`
     <h2>Scan with WhatsApp</h2>
     <img src="${qrDataUrl}" width="320">
-    <p>This QR refreshes automatically if required.</p>
-    <meta http-equiv='refresh' content='20'>
+    <meta http-equiv="refresh" content="20">
   `);
 });
 
 app.get("/status", (req, res) => {
-  res.json({ ok: true, waReady, sync: syncState, fullProspectImport: bulkImportState });
+  res.json({
+    ok: true,
+    waReady,
+    sync: syncState,
+    bulkImport: bulkImportState,
+    crmImportLabels: CRM_IMPORT_LABELS
+  });
 });
 
 app.get("/labels", async (req, res) => {
@@ -1364,7 +2140,9 @@ app.get("/labels", async (req, res) => {
   }
 
   try {
-    const labelObjects = await withDetachedFrameRetry(() => client.getLabels());
+    const labelObjects = await withDetachedFrameRetry(
+      () => client.getLabels()
+    );
 
     const labels = labelObjects
       .map(label => ({
@@ -1373,160 +2151,15 @@ app.get("/labels", async (req, res) => {
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
 
-    res.json({ ok: true, labels });
-  } catch (err) {
-    const detail = String(err && (err.stack || err.message || err));
-    console.error("Label preview failed:", detail);
-
-    res.status(500).json({
-      ok: false,
-      error: String(err && (err.message || err)),
-      detail
-    });
-  }
-});
-
-app.post("/sync/chats", async (req, res) => {
-  if (!waReady) {
-    return res.status(409).json({
-      ok: false,
-      error: "WhatsApp not connected"
-    });
-  }
-
-  if (syncState.running) {
-    return res.status(409).json({
-      ok: false,
-      error: "Sync already running"
-    });
-  }
-
-  const body = req.body || {};
-
-  const limitChats = Math.max(
-    1,
-    Math.min(Number(body.limitChats || 20), 250)
-  );
-
-  const messagesPerChat = Math.max(
-    10,
-    Math.min(Number(body.messagesPerChat || 150), 500)
-  );
-
-  const scanLimit = Math.max(
-    limitChats,
-    Math.min(Number(body.scanLimit || 250), 1000)
-  );
-
-  const labelFilter =
-    String(body.label || "Tenants").trim().toLowerCase();
-
-  syncState.running = true;
-
-  let chatsSeen = 0;
-  let messagesSaved = 0;
-  let chatsScanned = 0;
-
-  try {
-    const allChats =
-      await withDetachedFrameRetry(() => client.getChats());
-
-    const directChats = allChats
-      .filter(chat => !chat.isGroup)
-      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-    const selected = [];
-
-    for (const chat of directChats.slice(0, scanLimit)) {
-      chatsScanned++;
-
-      try {
-        const chatLabels = await withDetachedFrameRetry(
-          () => client.getChatLabels(chat.id._serialized),
-          2
-        );
-
-        const labelNames =
-          chatLabels.map(label => label.name).filter(Boolean);
-
-        const isMatch = labelNames.some(
-          name =>
-            String(name).trim().toLowerCase() === labelFilter
-        );
-
-        if (isMatch) {
-          selected.push({
-            chat,
-            labels: labelNames
-          });
-
-          if (selected.length >= limitChats) break;
-        }
-      } catch (err) {
-        console.warn(
-          `Could not read labels for ${chat.id && chat.id._serialized}:`,
-          String(err && (err.message || err))
-        );
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 80));
-    }
-
-    for (const { chat, labels } of selected) {
-      chatsSeen++;
-
-      try {
-        const renterId = await upsertRenter(chat, labels);
-
-        const messages = await withDetachedFrameRetry(
-          () => chat.fetchMessages({ limit: messagesPerChat }),
-          2
-        );
-
-        for (const message of messages) {
-          messagesSaved +=
-            await saveMessage(
-              chat.id._serialized,
-              renterId,
-              message
-            );
-        }
-
-        await updateRenterDates(renterId);
-      } catch (err) {
-        console.warn(
-          `Could not import chat ${chat.id && chat.id._serialized}:`,
-          String(err && (err.stack || err.message || err))
-        );
-      }
-    }
-
-    syncState = {
-      running: false,
-      lastSync: new Date().toISOString(),
-      chatsSeen,
-      messagesSaved
-    };
-
     res.json({
       ok: true,
-      label: body.label || "Tenants",
-      chatsScanned,
-      matchingChatsFound: selected.length,
-      ...syncState
+      labels,
+      crmImportLabels: CRM_IMPORT_LABELS
     });
   } catch (err) {
-    syncState.running = false;
-
-    const detail =
-      String(err && (err.stack || err.message || err));
-
-    console.error("Sync failed:", detail);
-
     res.status(500).json({
       ok: false,
-      error: String(err && (err.message || err)),
-      detail
+      error: String(err && (err.message || err))
     });
   }
 });
