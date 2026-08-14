@@ -114,19 +114,52 @@ export default async function Renters({ searchParams }) {
   `;
 
   let rows = [];
-  let counts = { total: 0, confirmed: 0, pending: 0, filtered: 0 };
+  let counts = {
+    total_contacts: 0,
+    potential: 0,
+    renter_prospect: 0,
+    existing_tenant: 0,
+    landlord: 0,
+    agent: 0,
+    other_rental_contact: 0,
+    unrelated: 0,
+    unknown_total: 0,
+    unreviewed: 0,
+    reviewed_unknown: 0,
+    active_renters: 0,
+    historical_renters: 0,
+    closed_renters: 0,
+    filtered: 0
+  };
 
   try {
     const baseCounts = (await pool.query(`
       SELECT
+        COUNT(*)::int AS total_contacts,
         COUNT(*) FILTER (
           WHERE contact_type='renter_prospect'
              OR (contact_type='unknown' AND classification_updated_at IS NULL)
-        )::int AS total,
-        COUNT(*) FILTER (WHERE contact_type='renter_prospect')::int AS confirmed,
+        )::int AS potential,
+        COUNT(*) FILTER (WHERE contact_type='renter_prospect')::int AS renter_prospect,
+        COUNT(*) FILTER (WHERE contact_type='existing_tenant')::int AS existing_tenant,
+        COUNT(*) FILTER (WHERE contact_type='landlord')::int AS landlord,
+        COUNT(*) FILTER (WHERE contact_type='agent')::int AS agent,
+        COUNT(*) FILTER (WHERE contact_type='other_rental_contact')::int AS other_rental_contact,
+        COUNT(*) FILTER (WHERE contact_type='unrelated')::int AS unrelated,
+        COUNT(*) FILTER (WHERE contact_type='unknown')::int AS unknown_total,
+        COUNT(*) FILTER (WHERE classification_updated_at IS NULL)::int AS unreviewed,
         COUNT(*) FILTER (
-          WHERE contact_type='unknown' AND classification_updated_at IS NULL
-        )::int AS pending
+          WHERE contact_type='unknown' AND classification_updated_at IS NOT NULL
+        )::int AS reviewed_unknown,
+        COUNT(*) FILTER (
+          WHERE contact_type='renter_prospect' AND status='active'
+        )::int AS active_renters,
+        COUNT(*) FILTER (
+          WHERE contact_type='renter_prospect' AND status='historical'
+        )::int AS historical_renters,
+        COUNT(*) FILTER (
+          WHERE contact_type='renter_prospect' AND status='closed'
+        )::int AS closed_renters
       FROM renters
     `)).rows[0];
 
@@ -154,6 +187,14 @@ export default async function Renters({ searchParams }) {
     console.error("Renter list failed:", err);
   }
 
+  const classifiedOut =
+    Number(counts.existing_tenant || 0) +
+    Number(counts.landlord || 0) +
+    Number(counts.agent || 0) +
+    Number(counts.other_rental_contact || 0) +
+    Number(counts.unrelated || 0) +
+    Number(counts.reviewed_unknown || 0);
+
   const hasFilters =
     q ||
     classification !== "all" ||
@@ -169,14 +210,29 @@ export default async function Renters({ searchParams }) {
     <>
       <h2>Renter demand</h2>
       <p className="intro">
-        Search, filter and sort confirmed renter enquiries plus imported contacts awaiting review.
+        Search, filter and sort potential renters. This breakdown shows exactly where every imported WhatsApp contact has been classified.
       </p>
 
       <div className="crm-grid" style={{marginBottom: 18}}>
-        <div className="crm-panel"><span>Potential renters</span><div className="crm-count">{counts.total}</div></div>
-        <div className="crm-panel"><span>Confirmed renters</span><div className="crm-count">{counts.confirmed}</div></div>
-        <div className="crm-panel"><span>Awaiting review</span><div className="crm-count">{counts.pending}</div></div>
-        <div className="crm-panel"><span>Showing now</span><div className="crm-count">{counts.filtered}</div></div>
+        <div className="crm-panel"><span>All CRM contacts</span><div className="crm-count">{counts.total_contacts}</div></div>
+        <div className="crm-panel"><span>Potential renters</span><div className="crm-count">{counts.potential}</div></div>
+        <div className="crm-panel"><span>Confirmed renters</span><div className="crm-count">{counts.renter_prospect}</div></div>
+        <div className="crm-panel"><span>Awaiting review</span><div className="crm-count">{counts.unreviewed}</div></div>
+        <div className="crm-panel"><span>Classified out</span><div className="crm-count">{classifiedOut}</div></div>
+        <div className="crm-panel"><span>Existing tenants</span><div className="crm-count">{counts.existing_tenant}</div></div>
+        <div className="crm-panel"><span>Landlords</span><div className="crm-count">{counts.landlord}</div></div>
+        <div className="crm-panel"><span>Agents</span><div className="crm-count">{counts.agent}</div></div>
+        <div className="crm-panel"><span>Other rental contacts</span><div className="crm-count">{counts.other_rental_contact}</div></div>
+        <div className="crm-panel"><span>Unrelated / private</span><div className="crm-count">{counts.unrelated}</div></div>
+        <div className="crm-panel"><span>Unknown total</span><div className="crm-count">{counts.unknown_total}</div></div>
+        <div className="crm-panel"><span>Reviewed but unknown</span><div className="crm-count">{counts.reviewed_unknown}</div></div>
+      </div>
+
+      <div className="crm-panel" style={{marginBottom:18, display:"flex", flexWrap:"wrap", gap:24}}>
+        <strong>Confirmed renter status</strong>
+        <span>Active: <strong>{counts.active_renters}</strong></span>
+        <span>Historical: <strong>{counts.historical_renters}</strong></span>
+        <span>Closed: <strong>{counts.closed_renters}</strong></span>
       </div>
 
       <form
@@ -287,7 +343,7 @@ export default async function Renters({ searchParams }) {
       </form>
 
       <div className="crm-muted" style={{marginBottom:10}}>
-        Showing {counts.filtered} of {counts.total} potential renter contacts.
+        Showing {counts.filtered} of {counts.potential} potential renter contacts.
       </div>
 
       <div style={{overflowX:"auto"}}>
