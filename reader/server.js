@@ -462,6 +462,15 @@ async function saveMessage(chatId, contactId, message) {
     })
   ]);
 
+  if (result.rowCount > 0 && contactId) {
+    await pool.query(`
+      UPDATE renters
+      SET analysis_updated_at=NULL,
+          updated_at=NOW()
+      WHERE id=$1
+    `, [contactId]);
+  }
+
   return result.rowCount;
 }
 
@@ -947,6 +956,308 @@ app.post(
  * return many unreviewed contacts WITH their stored messages in one call and
  * save many analyses in one call.
  */
+
+
+/* ---------------- GPT SUMMARY-ONLY BATCH API v2.4 ----------------
+ *
+ * These routes ENRICH every CRM contact with a chat summary and any
+ * evidence-based renter requirements. They deliberately do NOT change
+ * contact_type, relationship_status, classification_confidence or
+ * classification_updated_at. Contacts are never "classified out" by this
+ * workflow.
+ */
+
+app.get("/gpt/summary-batch", requireGptAuth, async (req, res) => {
+  const limit = Math.max(
+    1,
+    Math.min(Number(req.query.limit || 50), 50)
+  );
+
+  const mode = String(req.query.mode || "unreviewed")
+    .trim()
+    .toLowerCase();
+
+  if (!["all", "unreviewed"].includes(mode)) {
+    return res.status(400).json({
+      ok: false,
+      error: "mode must be all or unreviewed"
+    });
+  }
+
+  const afterId = Math.max(
+    0,
+    Number(req.query.after_id || 0)
+  );
+
+  try {
+    const values = [afterId, limit];
+    const reviewFilter =
+      mode === "unreviewed"
+        ? "AND r.analysis_updated_at IS NULL"
+        : "";
+
+    const totalResult = await pool.query(`
+      SELECT COUNT(*)::int AS count
+      FROM renters r
+      WHERE r.id > $1
+      ${reviewFilter}
+    `, [afterId]);
+
+    const contactsResult = await pool.query(`
+      SELECT
+        r.id,
+        r.display_name,
+        r.phone,
+        r.contact_type,
+        r.status,
+        r.labels,
+        r.first_enquiry_at,
+        r.last_message_at,
+        r.contact_summary,
+        r.requirement_summary,
+        r.area_wanted,
+        r.budget_min,
+        r.budget_max,
+        r.bedrooms,
+        r.preferred_floor,
+        r.wants_garden,
+        r.wants_rooftop,
+        r.pets_required,
+        r.pet_details,
+        r.parking_needed,
+        r.move_in_date,
+        r.occupants,
+        r.source_property,
+        r.analysis_confidence,
+        r.analysis_notes,
+        r.analysis_updated_at,
+        (
+          SELECT COUNT(*)::int
+          FROM whatsapp_messages wm
+          WHERE wm.renter_id=r.id
+        ) AS message_count
+      FROM renters r
+      WHERE r.id > $1
+      ${reviewFilter}
+      ORDER BY r.id ASC
+      LIMIT $2
+    `, values);
+
+    const contacts = [];
+
+    for (const contact of contactsResult.rows) {
+      const messagesResult = await pool.query(`
+        SELECT direction, body, message_type, message_at, id
+        FROM whatsapp_messages
+        WHERE renter_id=$1
+        ORDER BY message_at ASC NULLS FIRST, id ASC
+      `, [contact.id]);
+
+      contacts.push({
+        ...contact,
+        messages: messagesResult.rows
+      });
+    }
+
+    const nextAfterId =
+      contacts.length
+        ? Number(contacts[contacts.length - 1].id)
+        : afterId;
+
+    const remainingAfterCursor = Math.max(
+      0,
+      Number(totalResult.rows[0].count) - contacts.length
+    );
+
+    res.json({
+      ok: true,
+      mode,
+      count: contacts.length,
+      afterId,
+      nextAfterId,
+      hasMore: remainingAfterCursor > 0,
+      remainingAfterCursor,
+      contacts
+    });
+  } catch (err) {
+    console.error("GPT summary batch failed:", err);
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  }
+});
+
+app.post("/gpt/summary-batch", requireGptAuth, async (req, res) => {
+  const body = req.body || {};
+  const analyses = Array.isArray(body.analyses)
+    ? body.analyses
+    : [];
+
+  if (!analyses.length || analyses.length > 50) {
+    return res.status(400).json({
+      ok: false,
+      error: "analyses must contain between 1 and 50 items"
+    });
+  }
+
+  const seen = new Set();
+  const prepared = [];
+
+  for (let i = 0; i < analyses.length; i++) {
+    const item = analyses[i] || {};
+    const id = Number(item.id);
+
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(400).json({
+        ok: false,
+        error: `Invalid contact id at analyses[${i}]`
+      });
+    }
+
+    if (seen.has(id)) {
+      return res.status(400).json({
+        ok: false,
+        error: `Duplicate contact id ${id}`
+      });
+    }
+    seen.add(id);
+
+    const data = {
+      id,
+      contact_summary:
+        nullableString(item.contact_summary, 4000),
+      area_wanted:
+        nullableString(item.area_wanted, 500),
+      budget_min:
+        nullableInteger(item.budget_min),
+      budget_max:
+        nullableInteger(item.budget_max),
+      bedrooms:
+        nullableInteger(item.bedrooms),
+      preferred_floor:
+        nullableString(item.preferred_floor, 100),
+      wants_garden:
+        nullableBoolean(item.wants_garden),
+      wants_rooftop:
+        nullableBoolean(item.wants_rooftop),
+      pets_required:
+        nullableBoolean(item.pets_required),
+      pet_details:
+        nullableString(item.pet_details, 500),
+      parking_needed:
+        nullableBoolean(item.parking_needed),
+      move_in_date:
+        nullableDate(item.move_in_date),
+      occupants:
+        nullableString(item.occupants, 500),
+      source_property:
+        nullableString(item.source_property, 800),
+      requirement_summary:
+        nullableString(item.requirement_summary, 3000),
+      analysis_confidence:
+        nullableConfidence(item.analysis_confidence),
+      analysis_notes:
+        nullableString(item.analysis_notes, 3000)
+    };
+
+    if (
+      data.budget_min != null &&
+      data.budget_max != null &&
+      data.budget_min > data.budget_max
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: `budget_min cannot exceed budget_max for contact ${id}`
+      });
+    }
+
+    prepared.push(data);
+  }
+
+  const db = await pool.connect();
+
+  try {
+    await db.query("BEGIN");
+    const saved = [];
+
+    for (const data of prepared) {
+      const { rows } = await db.query(`
+        UPDATE renters SET
+          contact_summary=COALESCE($2, contact_summary),
+          area_wanted=COALESCE($3, area_wanted),
+          budget_min=COALESCE($4, budget_min),
+          budget_max=COALESCE($5, budget_max),
+          bedrooms=COALESCE($6, bedrooms),
+          preferred_floor=COALESCE($7, preferred_floor),
+          wants_garden=COALESCE($8, wants_garden),
+          wants_rooftop=COALESCE($9, wants_rooftop),
+          pets_required=COALESCE($10, pets_required),
+          pet_details=COALESCE($11, pet_details),
+          parking_needed=COALESCE($12, parking_needed),
+          move_in_date=COALESCE($13, move_in_date),
+          occupants=COALESCE($14, occupants),
+          source_property=COALESCE($15, source_property),
+          requirement_summary=COALESCE($16, requirement_summary),
+          analysis_confidence=COALESCE($17, analysis_confidence),
+          analysis_notes=COALESCE($18, analysis_notes),
+          analysis_source='custom_gpt_summary',
+          analysis_updated_at=NOW(),
+          updated_at=NOW()
+        WHERE id=$1
+        RETURNING
+          id,
+          contact_type,
+          contact_summary,
+          requirement_summary,
+          analysis_updated_at
+      `, [
+        data.id,
+        data.contact_summary,
+        data.area_wanted,
+        data.budget_min,
+        data.budget_max,
+        data.bedrooms,
+        data.preferred_floor,
+        data.wants_garden,
+        data.wants_rooftop,
+        data.pets_required,
+        data.pet_details,
+        data.parking_needed,
+        data.move_in_date,
+        data.occupants,
+        data.source_property,
+        data.requirement_summary,
+        data.analysis_confidence,
+        data.analysis_notes
+      ]);
+
+      if (!rows.length) {
+        throw new Error(`Contact ${data.id} was not found`);
+      }
+
+      saved.push(rows[0]);
+    }
+
+    await db.query("COMMIT");
+
+    res.json({
+      ok: true,
+      savedCount: saved.length,
+      saved
+    });
+  } catch (err) {
+    await db.query("ROLLBACK");
+    console.error("GPT summary batch save failed:", err);
+
+    res.status(500).json({
+      ok: false,
+      error: String(err && (err.message || err))
+    });
+  } finally {
+    db.release();
+  }
+});
 
 app.get("/gpt/review-batch", requireGptAuth, async (req, res) => {
   const limit = Math.max(

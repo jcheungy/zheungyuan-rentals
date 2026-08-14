@@ -1,0 +1,1011 @@
+openapi: 3.0.3
+info:
+  title: Zheungyuan Rental CRM
+  version: 2.4.0
+servers:
+- url: https://whatsapp-reader-production-e4bf.up.railway.app
+security:
+- bearerAuth: []
+paths:
+  /gpt/health:
+    get:
+      operationId: checkZheungyuanCRM
+      summary: Check CRM connection
+      responses:
+        '200':
+          description: CRM status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /gpt/overview:
+    get:
+      operationId: getRentalCRMOverview
+      summary: Get CRM counts
+      responses:
+        '200':
+          description: CRM overview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Overview'
+  /gpt/contacts:
+    get:
+      operationId: listRentalContacts
+      summary: List rental CRM contacts
+      parameters:
+      - in: query
+        name: analysis
+        schema:
+          type: string
+          enum:
+          - all
+          - unreviewed
+          - analysed
+          default: all
+      - in: query
+        name: type
+        schema:
+          type: string
+          enum:
+          - renter_prospect
+          - existing_tenant
+          - landlord
+          - agent
+          - other_rental_contact
+          - unrelated
+          - unknown
+      - in: query
+        name: limit
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 250
+          default: 100
+      responses:
+        '200':
+          description: Contact list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactList'
+  /gpt/contacts/{id}/conversation:
+    get:
+      operationId: getRentalContactConversation
+      summary: Read a page of one contact's stored WhatsApp messages
+      parameters:
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+      - in: query
+        name: limit
+        schema:
+          type: integer
+          minimum: 20
+          maximum: 500
+          default: 500
+      - in: query
+        name: offset
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+      responses:
+        '200':
+          description: Contact conversation page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+  /gpt/properties:
+    get:
+      operationId: listProperties
+      summary: List CRM properties
+      parameters:
+      - in: query
+        name: status
+        schema:
+          type: string
+      - in: query
+        name: contact_id
+        schema:
+          type: integer
+          minimum: 1
+      responses:
+        '200':
+          description: Properties
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertyList'
+    post:
+      operationId: createProperty
+      summary: Create a property extracted from a rental conversation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PropertyInput'
+      responses:
+        '200':
+          description: Created property
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertySave'
+  /gpt/properties/{id}:
+    post:
+      operationId: updateProperty
+      summary: Update an existing property
+      parameters:
+      - in: path
+        name: id
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PropertyInput'
+      responses:
+        '200':
+          description: Updated property
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropertySave'
+  /gpt/matches:
+    get:
+      operationId: listPropertyMatches
+      summary: List saved property/renter matches
+      responses:
+        '200':
+          description: Matches
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchList'
+    post:
+      operationId: savePropertyMatch
+      summary: Save or update one property/renter match
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatchInput'
+      responses:
+        '200':
+          description: Saved match
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchSave'
+  /gpt/summary-batch:
+    get:
+      operationId: getContactSummaryBatch
+      summary: Get CRM contacts with all stored messages for summary-only analysis
+      parameters:
+      - in: query
+        name: mode
+        schema:
+          type: string
+          enum:
+          - all
+          - unreviewed
+          default: unreviewed
+      - in: query
+        name: after_id
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+      - in: query
+        name: limit
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 50
+      responses:
+        '200':
+          description: Contacts and all stored messages for enrichment
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SummaryBatch'
+    post:
+      operationId: saveContactSummaryBatch
+      summary: Save chat summaries and renter requirements without changing contact
+        classification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SummaryBatchInput'
+      responses:
+        '200':
+          description: Summary batch saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SummaryBatchSave'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Health:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        service:
+          type: string
+        gptBridge:
+          type: boolean
+        crmVersion:
+          type: string
+    Overview:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        contacts:
+          type: object
+          properties:
+            total:
+              type: integer
+            renters:
+              type: integer
+            tenants:
+              type: integer
+            landlords:
+              type: integer
+            agents:
+              type: integer
+            reviewed:
+              type: integer
+        messages:
+          type: integer
+        properties:
+          type: object
+          properties:
+            total:
+              type: integer
+            available:
+              type: integer
+        matches:
+          type: integer
+    Contact:
+      type: object
+      properties:
+        id:
+          type: integer
+        display_name:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        contact_type:
+          type: string
+        contact_summary:
+          type: string
+          nullable: true
+        relationship_status:
+          type: string
+          nullable: true
+        status:
+          type: string
+        first_enquiry_at:
+          type: string
+          nullable: true
+        last_message_at:
+          type: string
+          nullable: true
+        labels:
+          type: array
+          items:
+            type: string
+        classification_confidence:
+          type: number
+          nullable: true
+        classification_updated_at:
+          type: string
+          nullable: true
+        requirement_summary:
+          type: string
+          nullable: true
+        area_wanted:
+          type: string
+          nullable: true
+        budget_min:
+          type: integer
+          nullable: true
+        budget_max:
+          type: integer
+          nullable: true
+        preferred_floor:
+          type: string
+          nullable: true
+        pets_required:
+          type: boolean
+          nullable: true
+        parking_needed:
+          type: boolean
+          nullable: true
+        analysis_updated_at:
+          type: string
+          nullable: true
+        message_count:
+          type: integer
+    ContactList:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        count:
+          type: integer
+        analysis:
+          type: string
+        contacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Contact'
+    Message:
+      type: object
+      properties:
+        direction:
+          type: string
+        body:
+          type: string
+          nullable: true
+        message_type:
+          type: string
+          nullable: true
+        message_at:
+          type: string
+          nullable: true
+        id:
+          type: integer
+    Conversation:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        contact:
+          $ref: '#/components/schemas/Contact'
+        totalMessages:
+          type: integer
+        offset:
+          type: integer
+        returned:
+          type: integer
+        hasMore:
+          type: boolean
+        nextOffset:
+          type: integer
+          nullable: true
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+    ReviewContact:
+      type: object
+      properties:
+        id:
+          type: integer
+        display_name:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        contact_type:
+          type: string
+        status:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        first_enquiry_at:
+          type: string
+          nullable: true
+        last_message_at:
+          type: string
+          nullable: true
+        contact_summary:
+          type: string
+          nullable: true
+        relationship_status:
+          type: string
+          nullable: true
+        requirement_summary:
+          type: string
+          nullable: true
+        area_wanted:
+          type: string
+          nullable: true
+        budget_min:
+          type: integer
+          nullable: true
+        budget_max:
+          type: integer
+          nullable: true
+        bedrooms:
+          type: integer
+          nullable: true
+        preferred_floor:
+          type: string
+          nullable: true
+        wants_garden:
+          type: boolean
+          nullable: true
+        wants_rooftop:
+          type: boolean
+          nullable: true
+        pets_required:
+          type: boolean
+          nullable: true
+        pet_details:
+          type: string
+          nullable: true
+        parking_needed:
+          type: boolean
+          nullable: true
+        move_in_date:
+          type: string
+          nullable: true
+        occupants:
+          type: string
+          nullable: true
+        source_property:
+          type: string
+          nullable: true
+        message_count:
+          type: integer
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+    ReviewBatch:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        count:
+          type: integer
+        remainingBefore:
+          type: integer
+        contacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReviewContact'
+    BatchAnalysisItem:
+      type: object
+      required:
+      - id
+      - contact_type
+      - contact_summary
+      - relationship_status
+      - classification_confidence
+      - status
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        contact_type:
+          type: string
+          enum:
+          - renter_prospect
+          - existing_tenant
+          - landlord
+          - agent
+          - other_rental_contact
+          - unrelated
+          - unknown
+        contact_summary:
+          type: string
+        relationship_status:
+          type: string
+        classification_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        status:
+          type: string
+          enum:
+          - active
+          - historical
+          - closed
+          - unknown
+          - not_prospect
+        area_wanted:
+          type: string
+        budget_min:
+          type: integer
+        budget_max:
+          type: integer
+        bedrooms:
+          type: integer
+        preferred_floor:
+          type: string
+        wants_garden:
+          type: boolean
+        wants_rooftop:
+          type: boolean
+        pets_required:
+          type: boolean
+        pet_details:
+          type: string
+        parking_needed:
+          type: boolean
+        move_in_date:
+          type: string
+          format: date
+        occupants:
+          type: string
+        source_property:
+          type: string
+        requirement_summary:
+          type: string
+        analysis_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        analysis_notes:
+          type: string
+    BatchAnalysisInput:
+      type: object
+      required:
+      - analyses
+      properties:
+        analyses:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/BatchAnalysisItem'
+    BatchSavedContact:
+      type: object
+      properties:
+        id:
+          type: integer
+        contact_type:
+          type: string
+        status:
+          type: string
+    BatchAnalysisSave:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        savedCount:
+          type: integer
+        remainingAfter:
+          type: integer
+        saved:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchSavedContact'
+    ContactAnalysisInput:
+      type: object
+      required:
+      - contact_type
+      - contact_summary
+      - relationship_status
+      - classification_confidence
+      - status
+      properties:
+        contact_type:
+          type: string
+          enum:
+          - renter_prospect
+          - existing_tenant
+          - landlord
+          - agent
+          - other_rental_contact
+          - unrelated
+          - unknown
+        contact_summary:
+          type: string
+        relationship_status:
+          type: string
+        classification_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        status:
+          type: string
+          enum:
+          - active
+          - historical
+          - closed
+          - unknown
+          - not_prospect
+        area_wanted:
+          type: string
+        budget_min:
+          type: integer
+        budget_max:
+          type: integer
+        bedrooms:
+          type: integer
+        preferred_floor:
+          type: string
+        wants_garden:
+          type: boolean
+        wants_rooftop:
+          type: boolean
+        pets_required:
+          type: boolean
+        pet_details:
+          type: string
+        parking_needed:
+          type: boolean
+        move_in_date:
+          type: string
+          format: date
+        occupants:
+          type: string
+        source_property:
+          type: string
+        requirement_summary:
+          type: string
+        analysis_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        analysis_notes:
+          type: string
+    ContactSave:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        contact:
+          type: object
+          properties:
+            id:
+              type: integer
+            contact_type:
+              type: string
+            contact_summary:
+              type: string
+              nullable: true
+            status:
+              type: string
+    Property:
+      type: object
+      properties:
+        id:
+          type: integer
+        owner_contact_id:
+          type: integer
+          nullable: true
+        source_contact_id:
+          type: integer
+          nullable: true
+        title:
+          type: string
+          nullable: true
+        area:
+          type: string
+          nullable: true
+        village:
+          type: string
+          nullable: true
+        address_text:
+          type: string
+          nullable: true
+        asking_rent:
+          type: integer
+          nullable: true
+        floor:
+          type: string
+          nullable: true
+        bedrooms:
+          type: integer
+          nullable: true
+        size_sqft:
+          type: integer
+          nullable: true
+        has_garden:
+          type: boolean
+          nullable: true
+        has_rooftop:
+          type: boolean
+          nullable: true
+        pets_allowed:
+          type: boolean
+          nullable: true
+        parking_spaces:
+          type: integer
+          nullable: true
+        availability_text:
+          type: string
+          nullable: true
+        available_from:
+          type: string
+          nullable: true
+        status:
+          type: string
+        property_summary:
+          type: string
+          nullable: true
+        source_notes:
+          type: string
+          nullable: true
+        analysis_confidence:
+          type: number
+          nullable: true
+        owner_name:
+          type: string
+          nullable: true
+        source_name:
+          type: string
+          nullable: true
+    PropertyInput:
+      type: object
+      required:
+      - title
+      - status
+      - property_summary
+      - analysis_confidence
+      properties:
+        owner_contact_id:
+          type: integer
+        source_contact_id:
+          type: integer
+        title:
+          type: string
+        area:
+          type: string
+        village:
+          type: string
+        address_text:
+          type: string
+        asking_rent:
+          type: integer
+        floor:
+          type: string
+        bedrooms:
+          type: integer
+        size_sqft:
+          type: integer
+        has_garden:
+          type: boolean
+        has_rooftop:
+          type: boolean
+        pets_allowed:
+          type: boolean
+        parking_spaces:
+          type: integer
+        availability_text:
+          type: string
+        available_from:
+          type: string
+          format: date
+        status:
+          type: string
+          enum:
+          - available
+          - rented
+          - off_market
+          - unknown
+        property_summary:
+          type: string
+        source_notes:
+          type: string
+        analysis_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+    PropertyList:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        count:
+          type: integer
+        properties:
+          type: array
+          items:
+            $ref: '#/components/schemas/Property'
+    PropertySave:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        property:
+          $ref: '#/components/schemas/Property'
+    Match:
+      type: object
+      properties:
+        id:
+          type: integer
+        property_id:
+          type: integer
+        renter_id:
+          type: integer
+        demand_type:
+          type: string
+        match_score:
+          type: integer
+        reasons:
+          type: string
+          nullable: true
+        status:
+          type: string
+        property_title:
+          type: string
+          nullable: true
+        renter_name:
+          type: string
+          nullable: true
+    MatchInput:
+      type: object
+      required:
+      - property_id
+      - renter_id
+      - demand_type
+      - match_score
+      - reasons
+      properties:
+        property_id:
+          type: integer
+        renter_id:
+          type: integer
+        demand_type:
+          type: string
+          enum:
+          - active
+          - historical
+        match_score:
+          type: integer
+          minimum: 0
+          maximum: 100
+        reasons:
+          type: string
+        status:
+          type: string
+    MatchList:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        count:
+          type: integer
+        matches:
+          type: array
+          items:
+            $ref: '#/components/schemas/Match'
+    MatchSave:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        match:
+          $ref: '#/components/schemas/Match'
+    SummaryAnalysisInput:
+      type: object
+      required:
+      - id
+      - contact_summary
+      properties:
+        id:
+          type: integer
+        contact_summary:
+          type: string
+        area_wanted:
+          type: string
+        budget_min:
+          type: integer
+        budget_max:
+          type: integer
+        bedrooms:
+          type: integer
+        preferred_floor:
+          type: string
+        wants_garden:
+          type: boolean
+        wants_rooftop:
+          type: boolean
+        pets_required:
+          type: boolean
+        pet_details:
+          type: string
+        parking_needed:
+          type: boolean
+        move_in_date:
+          type: string
+          format: date
+        occupants:
+          type: string
+        source_property:
+          type: string
+        requirement_summary:
+          type: string
+        analysis_confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        analysis_notes:
+          type: string
+    SummaryBatchInput:
+      type: object
+      required:
+      - analyses
+      properties:
+        analyses:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/SummaryAnalysisInput'
+    SummaryBatchContact:
+      type: object
+      properties:
+        id:
+          type: integer
+        display_name:
+          type: string
+        phone:
+          type: string
+        contact_type:
+          type: string
+        status:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        contact_summary:
+          type: string
+        requirement_summary:
+          type: string
+        message_count:
+          type: integer
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+    SummaryBatch:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        mode:
+          type: string
+        count:
+          type: integer
+        afterId:
+          type: integer
+        nextAfterId:
+          type: integer
+        hasMore:
+          type: boolean
+        remainingAfterCursor:
+          type: integer
+        contacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/SummaryBatchContact'
+    SummaryBatchSave:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        savedCount:
+          type: integer
